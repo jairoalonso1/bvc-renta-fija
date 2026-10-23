@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bvc-renta-fija"
-version = "0.2.0"
+version = "0.3.0"
 description = "Librería Python para extraer datos de renta fija de la Bolsa de Valores de Colombia (BVC)"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
 authors = [{name = "JAG"}]
-keywords = ["bvc", "renta-fija", "colombia", "scraper", "tes", "bonos"]
+keywords = ["bvc", "renta-fija", "colombia", "scraper", "tes", "bonos", "reporte"]
 dependencies = [
     "playwright>=1.40.0",
     "pandas>=2.0.0",
