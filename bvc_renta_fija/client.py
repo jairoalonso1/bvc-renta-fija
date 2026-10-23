@@ -430,8 +430,7 @@ class BVCRentaFija:
                     cleaned = (
                         df[col]
                         .astype(str)
-                        .str.replace(".", "", regex=False)
-                        .str.replace(",", ".", regex=False)
+                        .str.replace(",", "", regex=False)
                         .str.replace("%", "", regex=False)
                         .str.strip()
                     )
