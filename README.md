@@ -61,7 +61,7 @@ print("Reporte en:", path)
 
 ## Ficha facial y operaciones de un título
 
-La librería también puede abrir la ficha de una emisión y leer la tabla **Contado** de la pestaña **Operaciones** usando el navegador de Playwright. En la BVC, un nemotécnico puede corresponder a varias emisiones y vencimientos; para seleccionar una emisión concreta, pase `slug_url` con la URL exacta del detalle cuando esté disponible.
+La librería también puede abrir la ficha de una emisión y consultar las operaciones **Contado** desde el endpoint de mercado que usa el propio frontend oficial de BVC. Playwright se utiliza para iniciar la sesión pública del sitio y obtener los encabezados temporales requeridos; las filas se normalizan desde la respuesta JSON, no se reconstruyen a partir de datos sintéticos. En la BVC, un nemotécnico puede corresponder a varias emisiones y vencimientos; para seleccionar una emisión concreta, pase `slug_url` con la URL exacta del detalle cuando esté disponible.
 
 ```python
 from bvc_renta_fija import BVCRentaFija
@@ -74,11 +74,11 @@ with BVCRentaFija(headless=True) as client:
     print(ops)
 ```
 
-`get_operaciones_titulo` devuelve las columnas `Hora`, `Rueda`, `Precio`, `Tasa`, `Cantidad`, `Volúmenes` y `Procedencia`, además de `Nemotecnico`, `Fecha`, `Segmento` y `Fuente_datos`. Solo se extraen filas que la página muestra en el acordeón **Contado**; no se inventan operaciones si la BVC no devuelve movimientos. Cuando la fecha pedida no queda confirmada en el selector, se genera un error en lugar de atribuir por accidente operaciones de otra fecha.
+`get_operaciones_titulo` devuelve las columnas `Hora`, `Rueda`, `Precio`, `Tasa`, `Cantidad`, `Volúmenes` y `Procedencia`, además de `Nemotecnico`, `Fecha`, `Segmento` y `Fuente_datos`. Solo se extraen filas que devuelve la API oficial en `data.tab.contado`; no se inventan operaciones si la BVC no devuelve movimientos. Si el sitio bloquea la sesión, no genera el encabezado temporal requerido o la API rechaza la consulta, se genera un error explícito en vez de devolver una tabla vacía que parezca un día sin operaciones.
 
 `get_operaciones_dia(fecha=..., max_titulos=20)` ofrece una consolidación acotada por los primeros títulos únicos del listado. Para evitar carga innecesaria sobre la BVC, ajuste `max_titulos`; para una extracción exhaustiva, primero hay que confirmar límites de uso y disponibilidad de los datos de cada modalidad.
 
-**Importante sobre la validación:** el navegador usado para investigar la BVC confirmó el selector de fecha y los encabezados, pero no devolvió filas para el 22 de octubre de 2026 en esa sesión. Por ello, el código trata una respuesta sin filas como ausencia de datos; la captura proporcionada por el usuario sirve como referencia de columnas, no como dato hardcodeado de producción.
+**Importante sobre la validación:** se comprobó en una sesión del sitio oficial que el endpoint devuelve tres operaciones para `TFIT16300632` el 22 de octubre de 2026 (10:46, 10:50 y 11:42). Los valores de mercado se leen en tiempo de ejecución desde la respuesta de BVC; el caso se usa en pruebas de integración, no como dato hardcodeado de producción. Algunos entornos automatizados pueden recibir un 403 de CloudFront al abrir el sitio, lo que es una restricción de acceso del entorno y no una respuesta de mercado vacía.
 
 ## Créditos
 
