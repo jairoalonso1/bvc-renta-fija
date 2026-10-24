@@ -51,10 +51,16 @@ def test_date_picker_fails_loudly_when_input_is_missing():
         def is_disabled(self): return False
         def locator(self, *args, **kwargs): return FakeLoc(0)
     class FakePage:
+        url = "https://www.bvc.com.co/renta-fija-deuda-publica-segmento-publico/tfit16300632?tab=operaciones"
+        def wait_for_function(self, *args, **kwargs):
+            raise playwright.sync_api.TimeoutError("picker hydration timeout")
+        def title(self): return "Bolsa de Valores de Colombia"
         def locator(self, selector):
+            if selector == "body":
+                return FakeLoc(1, "Página sin date-picker")
             if selector == 'input[name="date"][type="date"]': return FakeLoc(0)
             return FakeLoc(0)
-    with pytest.raises(BVCDateSelectionError, match="botón del calendario"):
+    with pytest.raises(BVCDateSelectionError, match="no renderizó el selector de fecha"):
         BVCRentaFija()._seleccionar_fecha(FakePage(), date(2026, 10, 22))
 
 def test_no_movement_message_is_a_distinct_live_state():
