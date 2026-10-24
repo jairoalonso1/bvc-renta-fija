@@ -1,0 +1,94 @@
+name: BVC live integration test
+
+on:
+  push:
+    branches:
+      - feat/bvc-operations-extractor-v031
+    paths:
+      - ".github/workflows/bvc-live-integration.yml"
+      - "bvc_renta_fija/**"
+      - "tests/**"
+      - "pyproject.toml"
+      - "requirements.txt"
+  workflow_dispatch:
+    inputs:
+      fecha:
+        description: "Fecha de operaciones (YYYY-MM-DD)"
+        required: true
+        default: "2026-10-22"
+      nemotecnico:
+        description: "Nemotécnico BVC"
+        required: true
+        default: "TFIT16300632"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout feature branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install package and test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e . pytest
+
+      - name: Install Chromium and operating-system dependencies
+        run: python -m playwright install --with-deps chromium
+
+      - name: Run unit tests
+        run: python -m pytest -q
+
+      # BVC/CloudFront blocks some hosted runner IPs with HTTP 403. Keep the
+      # live test manually triggerable; every push still runs the deterministic unit tests.
+      - name: Run live BVC public-method integration test
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          BVC_DATE: ${{ inputs.fecha || '2026-10-22' }}
+          BVC_SYMBOL: ${{ inputs.nemotecnico || 'TFIT16300632' }}
+        run: |
+          python - <<'PY'
+          import os
+          from bvc_renta_fija.client import BVCRentaFija
+
+          symbol = os.environ["BVC_SYMBOL"].strip().upper()
+          fecha = os.environ["BVC_DATE"]
+          url = f"https://www.bvc.com.co/renta-fija-deuda-publica-segmento-publico/{symbol.lower()}?tab=operaciones"
+
+          with BVCRentaFija(timeout=60000) as client:
+              df = client.get_operaciones_titulo(
+                  nemotecnico=symbol,
+                  fecha=fecha,
+                  segmento="deuda_publica_segmento_publico",
+                  slug_url=url,
+              )
+
+          required = {"Hora", "Rueda", "Precio", "Tasa", "Cantidad", "Volúmenes", "Procedencia"}
+          missing = required.difference(df.columns)
+          print(f"ticker={symbol} date={fecha} rows={len(df)}")
+          print(df.to_string(index=False))
+          if missing:
+              raise AssertionError(f"Missing expected columns: {sorted(missing)}")
+          if df.empty:
+              raise AssertionError("BVC public method returned no operations for the integration-test case")
+          if symbol == "TFIT16300632" and fecha == "2026-10-22":
+              if len(df) != 3:
+                  raise AssertionError(f"Expected 3 live BVC operations, got {len(df)}")
+              expected_times = {"10:46", "10:50", "11:42"}
+              actual_times = set(df["Hora"].astype(str).str.strip())
+              if actual_times != expected_times:
+                  raise AssertionError(f"Unexpected operation times: {actual_times}")
+          print("LIVE_BVC_INTEGRATION_OK")
+          PY
