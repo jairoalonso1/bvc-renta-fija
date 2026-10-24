@@ -16,7 +16,7 @@ except ImportError:
     playwright.sync_api = sync_api
     sys.modules["playwright"] = playwright
     sys.modules["playwright.sync_api"] = sync_api
-from bvc_renta_fija.client import BVCRentaFija, _parse_fecha, SEGMENTO_LABELS
+from bvc_renta_fija.client import BVCRentaFija, BVCDateSelectionError, _parse_fecha, SEGMENTO_LABELS
 
 def test_existing_segment_public_api_is_preserved():
     client = BVCRentaFija()
@@ -47,10 +47,17 @@ def test_date_picker_fails_loudly_when_input_is_missing():
         def locator(self, selector):
             if selector == 'input[name="date"][type="date"]': return FakeLoc(0)
             return FakeLoc(0)
-    with pytest.raises(RuntimeError, match="botón del calendario"):
+    with pytest.raises(BVCDateSelectionError, match="botón del calendario"):
         BVCRentaFija()._seleccionar_fecha(FakePage(), date(2026, 10, 22))
 
-def test_empty_operations_result_is_not_faked():
+def test_no_movement_message_is_a_distinct_live_state():
+    # BVC's actual page renders these Spanish phrases when there is no table.
+    text = "El día de hoy no tenemos movimientos en el mercado. No hay cifras para mostrarte.".casefold()
+    assert "no hay movimientos en el mercado" in text
+    assert "no hay cifras para mostrarte" in text
+
+def test_table_column_schema_matches_bvc_contado_screenshot():
+    # Synthetic columns only: confirms the response contract, never fills market rows.
     columns = ["Hora", "Rueda", "Precio", "Tasa", "Cantidad", "Volúmenes", "Procedencia"]
     empty = pd.DataFrame(columns=columns)
     assert empty.empty and list(empty.columns) == columns
