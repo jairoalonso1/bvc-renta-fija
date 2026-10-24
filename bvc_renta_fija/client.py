@@ -198,83 +198,115 @@ class BVCRentaFija:
         root = roots.get(segmento or "deuda_corporativa", roots["deuda_corporativa"])
         return f"{root}/{nemotecnico.lower()}?tab={tab}"
 
-    def get_operaciones_titulo(self, nemotecnico: str, fecha: Optional[FechaLike] = None, segmento: Optional[Segmento] = "deuda_corporativa", slug_url: Optional[str] = None) -> pd.DataFrame:
-        """Extrae la tabla **Contado** de la pestaña Operaciones de una emisión BVC."""
-        target = _parse_fecha(fecha) if fecha is not None else None
-        symbol = str(nemotecnico).strip().upper()
+    @staticmethod
+    def _normalizar_operaciones_api(payload: dict, nemotecnico: str, fecha: date, segmento: Optional[Segmento]) -> pd.DataFrame:
+        """Convierte la respuesta oficial de operaciones BVC al esquema público."""
         cols = ["Hora", "Rueda", "Precio", "Tasa", "Cantidad", "Volúmenes", "Procedencia"]
         outcols = cols + ["Nemotecnico", "Fecha", "Segmento", "Fuente_datos"]
+        data = payload.get("data") if isinstance(payload, dict) else None
+        tab = data.get("tab", {}) if isinstance(data, dict) else {}
+        rows = tab.get("contado", []) if isinstance(tab, dict) else []
+        if not isinstance(rows, list):
+            rows = []
+        normalized = []
+        for item in rows:
+            if not isinstance(item, dict):
+                continue
+            origin = item.get("origin")
+            if isinstance(origin, dict):
+                origin = origin.get("es") or origin.get("en")
+            normalized.append({
+                "Hora": item.get("time"),
+                "Rueda": item.get("board"),
+                "Precio": item.get("price"),
+                "Tasa": item.get("rate"),
+                "Cantidad": item.get("quantity"),
+                "Volúmenes": item.get("volume"),
+                "Procedencia": origin,
+                "Nemotecnico": str(nemotecnico).strip().upper(),
+                "Fecha": fecha.isoformat(),
+                "Segmento": segmento,
+                "Fuente_datos": "BVC",
+            })
+        return pd.DataFrame(normalized, columns=outcols)
+
+    def get_operaciones_titulo(self, nemotecnico: str, fecha: Optional[FechaLike] = None, segmento: Optional[Segmento] = "deuda_corporativa", slug_url: Optional[str] = None) -> pd.DataFrame:
+        """Consulta la API de operaciones BVC usando el mismo handshake del sitio oficial.
+
+        La interfaz pública obtiene un token temporal en /api/handshake y envía
+        los encabezados token y k a rest.bvc.com.co. Se captura k de la petición
+        que genera el propio frontend para evitar codificar credenciales.
+        """
+        target = _parse_fecha(fecha) if fecha is not None else date.today()
+        symbol = str(nemotecnico).strip().upper()
+        outcols = ["Hora", "Rueda", "Precio", "Tasa", "Cantidad", "Volúmenes", "Procedencia",
+                   "Nemotecnico", "Fecha", "Segmento", "Fuente_datos"]
+        if segmento == "deuda_publica_segmento_publico":
+            filter_key, segment_filter = "marketDataRfPub", "&filters[marketDataRfPub][segment]=A2A"
+        elif segmento == "deuda_publica_segmento_privado":
+            filter_key, segment_filter = "marketDataRfPub", "&filters[marketDataRfPub][segment]=D2D"
+        else:
+            filter_key, segment_filter = "marketDataRfPriv", ""
+
         self._start()
         assert self._browser is not None
         page = self._browser.new_page()
+        captured = {}
+
+        def capture_api_headers(request):
+            if "rest.bvc.com.co/market-information/rf/lvl-3/operation" in request.url:
+                headers = request.headers
+                if headers.get("k"):
+                    captured["k"] = headers["k"]
+
+        page.on("request", capture_api_headers)
         try:
             page.set_default_timeout(self.timeout)
             url = slug_url or self._detalle_url(segmento, symbol, "operaciones")
             if "?" in url:
-                url = re.sub(r"([?&])tab=[^&]*", r"\1tab=operaciones", url)
+                url = re.sub(r"([?&])tab=[^&]*", r"\\1tab=operaciones", url)
                 if "tab=" not in url:
                     url += "&tab=operaciones"
             else:
                 url += "?tab=operaciones"
             page.goto(url, wait_until="domcontentloaded")
-            # BVC hidrata el date-picker con React después de DOMContentLoaded.
-            # Esperar por el selector evita fallos intermitentes en runners lentos.
-            page.wait_for_timeout(500)
-            if target is not None:
-                self._seleccionar_fecha(page, target)
-                page.wait_for_timeout(800)
-            # The live BVC page uses a direct tab body (not fixed accordion IDs).
-            # Read the rendered DOM and separately detect the explicit no-movements state.
-            tab_body = page.locator(".tabs-body-content-container").first
-            if not tab_body.count():
-                logger.warning("La BVC no renderizó el cuerpo de Operaciones para %s", symbol)
-                return pd.DataFrame(columns=outcols)
-            body_text = tab_body.inner_text().casefold()
-            no_activity = any(phrase in body_text for phrase in (
-                "no hay movimientos en el mercado",
-                "no tenemos movimientos en el mercado",
-                "no hay cifras para mostrarte",
-                "no se encontraron eventos",
-            ))
-            tables = pd.read_html(io.StringIO(tab_body.inner_html()))
-            table = None
-            expected = {"hora", "rueda", "precio", "cantidad", "volúmenes", "procedencia"}
-            for candidate in tables:
-                normalized = {str(c).strip().casefold() for c in candidate.columns}
-                if len(expected.intersection(normalized)) >= 5:
-                    table = candidate.copy()
-                    break
-            if table is None or table.empty:
-                if no_activity:
-                    logger.info("La BVC informó que no hubo movimientos para %s en %s", symbol, target)
-                else:
-                    logger.warning("La página de Operaciones de %s no mostró una tabla Contado reconocible", symbol)
-                return pd.DataFrame(columns=outcols)
-            rename = {}
-            for col in table.columns:
-                key = str(col).strip().casefold()
-                if key in {"tasa de interés", "tasa de interes"}:
-                    rename[col] = "Tasa"
-                elif key == "volumenes":
-                    rename[col] = "Volúmenes"
-                else:
-                    for canonical in cols:
-                        if key == canonical.casefold():
-                            rename[col] = canonical
-            table = table.rename(columns=rename)
-            for col in cols:
-                if col not in table:
-                    table[col] = pd.NA
-            table = table[cols].copy()
-            if target is not None:
-                table["Fecha"] = target.isoformat()
-            else:
-                selected = page.locator('input[name="date"][type="date"]').first
-                table["Fecha"] = selected.input_value() if selected.count() else date.today().isoformat()
-            table["Nemotecnico"] = symbol
-            table["Segmento"] = segmento
-            table["Fuente_datos"] = "BVC"
-            return table[outcols]
+            try:
+                page.wait_for_function("() => performance.getEntriesByType('resource').some(e => e.name.includes('/market-information/rf/lvl-3/operation'))",
+                                       timeout=min(self.timeout, 12000))
+            except PlaywrightTimeout:
+                pass
+            if not captured.get("k"):
+                raise RuntimeError(
+                    "BVC no generó la petición inicial de operaciones; no fue posible "
+                    f"capturar el encabezado k. URL={page.url!r}; título={page.title()!r}"
+                )
+
+            query = (
+                f"filters[{filter_key}][tradeDate]={target.isoformat()}"
+                f"&filters[{filter_key}][symbol]={symbol}{segment_filter}"
+            )
+            result = page.evaluate(
+                """async ({query, k}) => {
+                    const handshakeUrl = '/api/handshake?ts=' + Date.now() + '&r=' + crypto.randomUUID();
+                    const handshake = await fetch(handshakeUrl, {credentials: 'include'});
+                    if (!handshake.ok) throw new Error('BVC handshake HTTP ' + handshake.status);
+                    const auth = await handshake.json();
+                    if (!auth || !auth.token) throw new Error('BVC handshake did not return a token');
+                    const response = await fetch('https://rest.bvc.com.co/market-information/rf/lvl-3/operation?' + query, {
+                        method: 'GET',
+                        headers: { token: auth.token, k, origin: location.origin }
+                    });
+                    const text = await response.text();
+                    let body;
+                    try { body = JSON.parse(text); } catch { body = {message: text.slice(0, 500)}; }
+                    if (!response.ok) {
+                        throw new Error('BVC operations API HTTP ' + response.status + ': ' + JSON.stringify(body).slice(0, 500));
+                    }
+                    return body;
+                }""",
+                {"query": query, "k": captured["k"]},
+            )
+            return self._normalizar_operaciones_api(result, symbol, target, segmento)[outcols]
         finally:
             page.close()
 
