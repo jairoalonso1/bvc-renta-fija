@@ -264,7 +264,7 @@ class BVCRentaFija:
             page.set_default_timeout(self.timeout)
             url = slug_url or self._detalle_url(segmento, symbol, "operaciones")
             if "?" in url:
-                url = re.sub(r"([?&])tab=[^&]*", r"\\1tab=operaciones", url)
+                url = re.sub(r"([?&])tab=[^&]*", r"\1tab=operaciones", url)
                 if "tab=" not in url:
                     url += "&tab=operaciones"
             else:
