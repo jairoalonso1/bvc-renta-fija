@@ -373,11 +373,31 @@ class BVCRentaFija:
             page.close()
 
     def _seleccionar_fecha(self, page: Page, target: date) -> None:
-        """Selecciona una fecha en el date-picker de BVC y valida el valor final."""
+        """Selecciona una fecha en el date-picker de BVC y valida el valor final.
+
+        La interfaz BVC actual muestra campos visibles separados para año, mes y día;
+        el input[type=date] existe pero está oculto. Preferimos editar los campos visibles
+        y comprobar el valor ISO que React termina aplicando.
+        """
         meses = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
         date_input = page.locator('input[name="date"][type="date"]').first
         if date_input.count() and date_input.input_value() == target.isoformat():
             return
+        year_input = page.locator('input[name="year"]').first
+        month_input = page.locator('input[name="month"]').first
+        day_input = page.locator('input[name="day"]').first
+        if year_input.count() and month_input.count() and day_input.count():
+            year_input.fill(str(target.year))
+            month_input.fill(f"{target.month:02d}")
+            day_input.fill(f"{target.day:02d}")
+            day_input.press("Tab")
+            page.wait_for_timeout(500)
+            if date_input.count() and date_input.input_value() == target.isoformat():
+                return
+            actual_value = date_input.input_value() if date_input.count() else None
+            raise BVCDateSelectionError(
+                f"BVC no confirmó la fecha {target.isoformat()} tras editar año/mes/día; valor actual={actual_value!r}"
+            )
         calendar_button = page.locator("button.react-date-picker__calendar-button").first
         if not calendar_button.count():
             calendar_button = page.locator("[class*='date-picker'] button").first
