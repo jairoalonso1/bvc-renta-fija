@@ -217,10 +217,12 @@ class BVCRentaFija:
             else:
                 url += "?tab=operaciones"
             page.goto(url, wait_until="domcontentloaded")
-            page.wait_for_timeout(1200)
+            # BVC hidrata el date-picker con React después de DOMContentLoaded.
+            # Esperar por el selector evita fallos intermitentes en runners lentos.
+            page.wait_for_timeout(500)
             if target is not None:
                 self._seleccionar_fecha(page, target)
-                page.wait_for_timeout(1200)
+                page.wait_for_timeout(800)
             # The live BVC page uses a direct tab body (not fixed accordion IDs).
             # Read the rendered DOM and separately detect the explicit no-movements state.
             tab_body = page.locator(".tabs-body-content-container").first
@@ -373,19 +375,41 @@ class BVCRentaFija:
             page.close()
 
     def _seleccionar_fecha(self, page: Page, target: date) -> None:
-        """Selecciona una fecha en el date-picker de BVC y valida el valor final.
+        """Selecciona y verifica una fecha en el date-picker de BVC.
 
-        La interfaz BVC actual muestra campos visibles separados para año, mes y día;
-        el input[type=date] existe pero está oculto. Preferimos editar los campos visibles
-        y comprobar el valor ISO que React termina aplicando.
+        BVC renderiza campos visibles separados para año, mes y día y un input
+        ISO oculto. Espera a que React hidrate el selector y solo usa el calendario
+        como alternativa si los campos separados no están disponibles.
         """
         meses = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
-        date_input = page.locator('input[name="date"][type="date"]').first
+        date_selector = 'input[name="date"][type="date"]'
+        year_selector = 'input[name="year"]'
+        month_selector = 'input[name="month"]'
+        day_selector = 'input[name="day"]'
+
+        # La página puede devolver DOMContentLoaded antes de que React monte el picker.
+        try:
+            page.wait_for_function(
+                """() => document.querySelector('input[name="year"]') ||
+                         document.querySelector('input[name="date"][type="date"]') ||
+                         document.querySelector('[class*="date-picker"]')""",
+                timeout=min(self.timeout, 15000),
+            )
+        except PlaywrightTimeout:
+            title = page.title()
+            excerpt = re.sub(r"\s+", " ", page.locator("body").inner_text() if page.locator("body").count() else "")[:300]
+            raise BVCDateSelectionError(
+                f"BVC no renderizó el selector de fecha para {target.isoformat()}. "
+                f"URL={page.url!r}; título={title!r}; contenido={excerpt!r}"
+            )
+
+        date_input = page.locator(date_selector).first
         if date_input.count() and date_input.input_value() == target.isoformat():
             return
-        year_input = page.locator('input[name="year"]').first
-        month_input = page.locator('input[name="month"]').first
-        day_input = page.locator('input[name="day"]').first
+
+        year_input = page.locator(year_selector).first
+        month_input = page.locator(month_selector).first
+        day_input = page.locator(day_selector).first
         if year_input.count() and month_input.count() and day_input.count():
             year_input.fill(str(target.year))
             month_input.fill(f"{target.month:02d}")
@@ -396,18 +420,37 @@ class BVCRentaFija:
                 return
             actual_value = date_input.input_value() if date_input.count() else None
             raise BVCDateSelectionError(
-                f"BVC no confirmó la fecha {target.isoformat()} tras editar año/mes/día; valor actual={actual_value!r}"
+                f"BVC no confirmó la fecha {target.isoformat()} tras editar año/mes/día; "
+                f"valor actual={actual_value!r}; URL={page.url!r}"
             )
-        calendar_button = page.locator("button.react-date-picker__calendar-button").first
-        if not calendar_button.count():
-            calendar_button = page.locator("[class*='date-picker'] button").first
-        if not calendar_button.count():
-            raise BVCDateSelectionError("No se encontró el botón del calendario de BVC")
+
+        calendar_selectors = [
+            "button.react-date-picker__calendar-button",
+            "button[class*='calendar-button']",
+            "[class*='date-picker'] button[aria-expanded]",
+            "[class*='date-picker'] button",
+        ]
+        calendar_button = None
+        for selector in calendar_selectors:
+            candidate = page.locator(selector).first
+            if candidate.count():
+                calendar_button = candidate
+                break
+        if calendar_button is None:
+            title = page.title()
+            excerpt = re.sub(r"\s+", " ", page.locator("body").inner_text() if page.locator("body").count() else "")[:300]
+            raise BVCDateSelectionError(
+                f"No se encontró el botón del calendario de BVC para {target.isoformat()}. "
+                f"URL={page.url!r}; título={title!r}; contenido={excerpt!r}"
+            )
+
         calendar_button.click()
         page.wait_for_timeout(300)
         nav_label = page.locator("button.react-calendar__navigation__label").first
         if not nav_label.count():
-            raise BVCDateSelectionError("BVC abrió el date-picker pero no mostró el selector del mes")
+            raise BVCDateSelectionError(
+                f"BVC abrió el date-picker pero no mostró el selector del mes. URL={page.url!r}"
+            )
         for _ in range(180):
             label = nav_label.inner_text().strip().lower()
             month_found = next((i + 1 for i, name in enumerate(meses) if name in label), None)
@@ -437,12 +480,14 @@ class BVCRentaFija:
             raise BVCDateSelectionError(f"La BVC no ofrece un día seleccionable para {target.isoformat()}")
         tile.click()
         page.wait_for_timeout(500)
-        actual = page.locator('input[name="date"][type="date"]').first
+        actual = page.locator(date_selector).first
         if not actual.count():
             raise BVCDateSelectionError("No se pudo validar la fecha seleccionada: falta input[name=date]")
         selected = actual.input_value()
         if selected != target.isoformat():
-            raise BVCDateSelectionError(f"BVC no confirmó la fecha {target.isoformat()}; la interfaz quedó en {selected!r}")
+            raise BVCDateSelectionError(
+                f"BVC no confirmó la fecha {target.isoformat()}; la interfaz quedó en {selected!r}"
+            )
 
     @staticmethod
     def _col_nemotecnico(df: pd.DataFrame) -> Optional[str]:
