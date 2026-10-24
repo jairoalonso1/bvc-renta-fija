@@ -1,6 +1,15 @@
 name: BVC live integration test
 
 on:
+  push:
+    branches:
+      - feat/bvc-operations-extractor-v031
+    paths:
+      - ".github/workflows/bvc-live-integration.yml"
+      - "bvc_renta_fija/**"
+      - "tests/**"
+      - "pyproject.toml"
+      - "requirements.txt"
   workflow_dispatch:
     inputs:
       fecha:
@@ -44,8 +53,8 @@ jobs:
 
       - name: Run live BVC public-method integration test
         env:
-          BVC_DATE: ${{ inputs.fecha }}
-          BVC_SYMBOL: ${{ inputs.nemotecnico }}
+          BVC_DATE: ${{ inputs.fecha || '2026-10-22' }}
+          BVC_SYMBOL: ${{ inputs.nemotecnico || 'TFIT16300632' }}
         run: |
           python - <<'PY'
           import os
