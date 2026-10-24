@@ -74,3 +74,60 @@ def test_table_column_schema_matches_bvc_contado_screenshot():
     columns = ["Hora", "Rueda", "Precio", "Tasa", "Cantidad", "Volúmenes", "Procedencia"]
     empty = pd.DataFrame(columns=columns)
     assert empty.empty and list(empty.columns) == columns
+
+def test_official_operations_api_payload_maps_to_public_columns():
+    payload = {
+        "data": {
+            "tab": {
+                "contado": [
+                    {
+                        "time": "10:46",
+                        "board": "RTES",
+                        "price": 77.012,
+                        "rate": 12.93,
+                        "quantity": 40000000000,
+                        "volume": 31679320000,
+                        "origin": {"es": "Registro", "en": "OTC (NegDeal)"},
+                    },
+                    {
+                        "time": "10:50",
+                        "board": "RTES",
+                        "price": 76.973,
+                        "rate": 12.942,
+                        "quantity": 40000000000,
+                        "volume": 31663720000,
+                        "origin": {"es": "Registro", "en": "OTC (NegDeal)"},
+                    },
+                    {
+                        "time": "11:42",
+                        "board": "RTES",
+                        "price": 76.834,
+                        "rate": 12.985,
+                        "quantity": 40000000000,
+                        "volume": 31608120000,
+                        "origin": {"es": "Registro", "en": "OTC (NegDeal)"},
+                    },
+                ]
+            }
+        }
+    }
+    df = BVCRentaFija._normalizar_operaciones_api(
+        payload, "TFIT16300632", date(2026, 10, 22), "deuda_publica_segmento_publico"
+    )
+    assert list(df["Hora"]) == ["10:46", "10:50", "11:42"]
+    assert list(df["Precio"]) == [77.012, 76.973, 76.834]
+    assert list(df["Procedencia"]) == ["Registro", "Registro", "Registro"]
+    assert set(df["Fuente_datos"]) == {"BVC"}
+    assert set(df["Fecha"]) == {"2026-10-22"}
+
+
+def test_official_operations_api_empty_tab_returns_empty_schema():
+    df = BVCRentaFija._normalizar_operaciones_api(
+        {"data": {"tab": {}}}, "TFIT16300632", date(2026, 10, 22),
+        "deuda_publica_segmento_publico"
+    )
+    assert df.empty
+    assert list(df.columns) == [
+        "Hora", "Rueda", "Precio", "Tasa", "Cantidad", "Volúmenes", "Procedencia",
+        "Nemotecnico", "Fecha", "Segmento", "Fuente_datos"
+    ]
