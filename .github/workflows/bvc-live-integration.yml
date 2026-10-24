@@ -51,7 +51,10 @@ jobs:
       - name: Run unit tests
         run: python -m pytest -q
 
+      # BVC/CloudFront blocks some hosted runner IPs with HTTP 403. Keep the
+      # live test manually triggerable; every push still runs the deterministic unit tests.
       - name: Run live BVC public-method integration test
+        if: github.event_name == 'workflow_dispatch'
         env:
           BVC_DATE: ${{ inputs.fecha || '2026-10-22' }}
           BVC_SYMBOL: ${{ inputs.nemotecnico || 'TFIT16300632' }}
