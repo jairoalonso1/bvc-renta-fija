@@ -1,29 +1,18 @@
-"""Ejemplo de uso de bvc-renta-fija con rangos e historial."""
+"""Ejemplo básico para consultar renta fija de la BVC."""
 from bvc_renta_fija import BVCRentaFija
 
-def main():
+
+def main() -> None:
     with BVCRentaFija(headless=True, cache_dir="./cache") as client:
-        print("=== Deuda publica segmento publico (hoy) ===")
-        df = client.get_deuda_publica_segmento_publico()
+        df = client.get_deuda_corporativa(fecha="2026-10-22")
         print(df.head(8))
-        print(f"Filas: {len(df)}\n")
+        print(f"Filas devueltas por la fuente: {len(df)}")
+        operaciones = client.get_operaciones_titulo("CDTBBO80", fecha="2026-10-22", segmento="deuda_corporativa")
+        if operaciones.empty:
+            print("La BVC no devolvió operaciones visibles para los parámetros indicados.")
+        else:
+            print(operaciones.head())
 
-        print("=== Busqueda TFIT08031127 ===")
-        df_tes = client.buscar(nemotecnico="TFIT08031127")
-        print(df_tes)
-        print()
-
-        # Descomenta para probar rango (tarda mas):
-        # print("=== Historial últimos 5 días hábiles ===")
-        # from datetime import date, timedelta
-        # fin = date.today()
-        # ini = fin - timedelta(days=10)
-        # hist = client.get_historial_nemotecnico(
-        #     nemotecnico="TFIT08031127",
-        #     fecha_inicio=ini,
-        #     fecha_fin=fin,
-        # )
-        # print(hist)
 
 if __name__ == "__main__":
     main()

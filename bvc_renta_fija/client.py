@@ -1,440 +1,268 @@
-"""
-Cliente Playwright para extraer datos de renta fija de la BVC.
-
-Soporta:
-- Los tres segmentos (público, privado, corporativa)
-- Fecha única o rango de fechas
-- Búsqueda por nemotécnico
-- Historial de un nemotécnico en un rango
-- Cache local opcional en Parquet
-"""
 from __future__ import annotations
 
-import io
 import logging
+import re
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from enum import Enum
 from pathlib import Path
-from typing import Literal, Optional, Union
+from typing import Any
 
 import pandas as pd
-from playwright.sync_api import (
-    sync_playwright,
-    Page,
-    Browser,
-    TimeoutError as PlaywrightTimeout,
-)
+from playwright.sync_api import Browser, BrowserContext, Page, sync_playwright
 
 logger = logging.getLogger(__name__)
 
-BASE_URL = "https://www.bvc.com.co/mercado-local-en-linea?tab=renta-fija"
 
-Segmento = Literal[
-    "deuda_publica_segmento_publico",
-    "deuda_publica_segmento_privado",
-    "deuda_corporativa",
-]
+class Segmento(str, Enum):
+    DEUDA_PUBLICA_PUBLICA = "deuda_publica_publica"
+    DEUDA_PUBLICA_PRIVADA = "deuda_publica_privada"
+    DEUDA_CORPORATIVA = "deuda_corporativa"
+
 
 SEGMENTO_LABELS = {
-    "deuda_publica_segmento_publico": "Deuda pública segmento público",
-    "deuda_publica_segmento_privado": "Deuda pública segmento privado",
-    "deuda_corporativa": "Deuda corporativa",
+    Segmento.DEUDA_PUBLICA_PUBLICA: "Deuda pública - pública",
+    Segmento.DEUDA_PUBLICA_PRIVADA: "Deuda pública - privada",
+    Segmento.DEUDA_CORPORATIVA: "Deuda corporativa",
 }
 
-FechaLike = Union[str, date]
+SEGMENTO_URLS = {
+    Segmento.DEUDA_PUBLICA_PUBLICA: "https://www.bvc.com.co/mercados/market-information/debt/public-debt",
+    Segmento.DEUDA_PUBLICA_PRIVADA: "https://www.bvc.com.co/mercados/market-information/debt/private-debt",
+    Segmento.DEUDA_CORPORATIVA: "https://www.bvc.com.co/mercados/market-information/debt/corporate-debt",
+}
 
 
-def _parse_fecha(fecha: FechaLike) -> date:
-    if isinstance(fecha, date):
-        return fecha
-    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%Y/%m/%d"):
+def parse_bvc_number(val: Any) -> float:
+    """Convierte números mostrados por la BVC a float sin confundir decimales."""
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return float("nan")
+    if isinstance(val, (int, float)):
+        return float(val)
+    raw = str(val).strip().replace("\xa0", "").replace(" ", "")
+    if not raw or raw in {"-", "—", "–", "N/A", "n/a"}:
+        return float("nan")
+    raw = re.sub(r"[^0-9,\.\-]", "", raw)
+    if not raw or raw in {"-", ".", ","}:
+        return float("nan")
+    if "," in raw and "." in raw:
+        if raw.rfind(",") > raw.rfind("."):
+            raw = raw.replace(".", "").replace(",", ".")
+        else:
+            raw = raw.replace(",", "")
+    elif "," in raw:
+        tail = raw.rsplit(",", 1)[1]
+        if len(tail) == 3 and raw.count(",") == 1:
+            raw = raw.replace(",", "")
+        else:
+            raw = raw.replace(",", ".")
+    elif raw.count(".") > 1:
+        parts = raw.split(".")
+        raw = "".join(parts) if len(parts[-1]) == 3 else "".join(parts[:-1]) + "." + parts[-1]
+    try:
+        return float(raw)
+    except ValueError:
+        return float("nan")
+
+
+def _parse_fecha(value: Any) -> date | None:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    text = str(value).strip()
+    if not text:
+        return None
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%Y/%m/%d", "%d %b %Y", "%d %B %Y"):
         try:
-            return datetime.strptime(fecha, fmt).date()
+            return datetime.strptime(text, fmt).date()
         except ValueError:
             continue
-    raise ValueError(f"Formato de fecha no reconocido: {fecha}")
+    try:
+        return pd.to_datetime(text, dayfirst=True, errors="raise").date()
+    except (ValueError, TypeError, OverflowError):
+        return None
 
 
-def _daterange(inicio: date, fin: date):
-    """Genera días hábiles aproximados (lunes-viernes)."""
-    cur = inicio
-    while cur <= fin:
-        if cur.weekday() < 5:  # 0=lun ... 4=vie
-            yield cur
-        cur += timedelta(days=1)
+def _rango_dias_habiles(fecha: date, dias: int) -> list[date]:
+    if dias < 1:
+        raise ValueError("dias debe ser >= 1")
+    result: list[date] = []
+    current = fecha
+    while len(result) < dias:
+        if current.weekday() < 5:
+            result.append(current)
+        current -= timedelta(days=1)
+    return result
 
 
-class BVCRentaFija:
-    """Cliente de alto nivel para consultar renta fija BVC."""
+@dataclass
+class BVCClient:
+    headless: bool = True
+    timeout_ms: int = 20000
+    cache_dir: str | Path | None = None
 
-    def __init__(
-        self,
-        headless: bool = True,
-        timeout: int = 30_000,
-        cache_dir: Optional[str | Path] = None,
-    ):
-        self.headless = headless
-        self.timeout = timeout
-        self.cache_dir = Path(cache_dir) if cache_dir else None
-        if self.cache_dir:
-            self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self._browser: Optional[Browser] = None
+    def __post_init__(self) -> None:
         self._playwright = None
+        self._browser: Browser | None = None
+        self._context: BrowserContext | None = None
+        self._page: Page | None = None
 
-    def __enter__(self):
-        self._start()
-        return self
-
-    def __exit__(self, *args):
-        self.close()
-
-    def _start(self):
-        if self._browser is not None:
-            return
+    def __enter__(self) -> "BVCClient":
         self._playwright = sync_playwright().start()
         self._browser = self._playwright.chromium.launch(headless=self.headless)
+        self._context = self._browser.new_context()
+        self._page = self._context.new_page()
+        self._page.set_default_timeout(self.timeout_ms)
+        return self
 
-    def close(self):
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        self.close()
+
+    def close(self) -> None:
+        if self._context:
+            self._context.close()
+            self._context = None
         if self._browser:
             self._browser.close()
             self._browser = None
         if self._playwright:
             self._playwright.stop()
             self._playwright = None
+        self._page = None
 
-    # ------------------------------------------------------------------
-    # API pública — segmentos
-    # ------------------------------------------------------------------
+    def _require_page(self) -> Page:
+        if self._page is None:
+            raise RuntimeError("Use BVCClient dentro de un bloque 'with' o llame __enter__ primero")
+        return self._page
 
-    def get_deuda_publica_segmento_publico(
-        self,
-        fecha: Optional[FechaLike] = None,
-        fecha_inicio: Optional[FechaLike] = None,
-        fecha_fin: Optional[FechaLike] = None,
-    ) -> pd.DataFrame:
-        return self._get(
-            "deuda_publica_segmento_publico",
-            fecha=fecha,
-            fecha_inicio=fecha_inicio,
-            fecha_fin=fecha_fin,
-        )
+    @staticmethod
+    def _coerce_segmento(segmento: Segmento | str) -> Segmento:
+        if isinstance(segmento, Segmento):
+            return segmento
+        normalized = str(segmento).strip().lower().replace("-", "_").replace(" ", "_")
+        aliases = {
+            "publica_publica": Segmento.DEUDA_PUBLICA_PUBLICA,
+            "deuda_publica_publica": Segmento.DEUDA_PUBLICA_PUBLICA,
+            "publica_privada": Segmento.DEUDA_PUBLICA_PRIVADA,
+            "deuda_publica_privada": Segmento.DEUDA_PUBLICA_PRIVADA,
+            "corporativa": Segmento.DEUDA_CORPORATIVA,
+            "deuda_corporativa": Segmento.DEUDA_CORPORATIVA,
+        }
+        if normalized not in aliases:
+            raise ValueError(f"Segmento no soportado: {segmento!r}")
+        return aliases[normalized]
 
-    def get_deuda_publica_segmento_privado(
-        self,
-        fecha: Optional[FechaLike] = None,
-        fecha_inicio: Optional[FechaLike] = None,
-        fecha_fin: Optional[FechaLike] = None,
-    ) -> pd.DataFrame:
-        return self._get(
-            "deuda_publica_segmento_privado",
-            fecha=fecha,
-            fecha_inicio=fecha_inicio,
-            fecha_fin=fecha_fin,
-        )
-
-    def get_deuda_corporativa(
-        self,
-        fecha: Optional[FechaLike] = None,
-        fecha_inicio: Optional[FechaLike] = None,
-        fecha_fin: Optional[FechaLike] = None,
-    ) -> pd.DataFrame:
-        return self._get(
-            "deuda_corporativa",
-            fecha=fecha,
-            fecha_inicio=fecha_inicio,
-            fecha_fin=fecha_fin,
-        )
-
-    def get_todo(
-        self,
-        fecha: Optional[FechaLike] = None,
-        fecha_inicio: Optional[FechaLike] = None,
-        fecha_fin: Optional[FechaLike] = None,
-    ) -> pd.DataFrame:
-        """Concatena los tres segmentos."""
-        frames = []
-        for seg in SEGMENTO_LABELS:
-            df = self._get(seg, fecha=fecha, fecha_inicio=fecha_inicio, fecha_fin=fecha_fin)
-            if not df.empty:
-                df = df.copy()
-                df["Segmento"] = SEGMENTO_LABELS[seg]
-                frames.append(df)
-        if not frames:
-            return pd.DataFrame()
-        return pd.concat(frames, ignore_index=True)
-
-    # ------------------------------------------------------------------
-    # API pública — búsqueda
-    # ------------------------------------------------------------------
-
-    def buscar(
-        self,
-        nemotecnico: str,
-        fecha: Optional[FechaLike] = None,
-        fecha_inicio: Optional[FechaLike] = None,
-        fecha_fin: Optional[FechaLike] = None,
-        segmento: Optional[Segmento] = None,
-    ) -> pd.DataFrame:
-        """Filtra por nemotécnico en uno o todos los segmentos."""
-        segmentos: list[Segmento] = (
-            [segmento]
-            if segmento
-            else list(SEGMENTO_LABELS.keys())  # type: ignore
-        )
-        frames = []
-        for seg in segmentos:
-            df = self._get(
-                seg,
-                fecha=fecha,
-                fecha_inicio=fecha_inicio,
-                fecha_fin=fecha_fin,
-            )
-            if df.empty:
-                continue
-            col = self._col_nemotecnico(df)
-            if col is None:
-                continue
-            mask = df[col].astype(str).str.upper() == nemotecnico.upper()
-            filtered = df.loc[mask].copy()
-            if not filtered.empty:
-                filtered["Segmento"] = SEGMENTO_LABELS[seg]
-                frames.append(filtered)
-        if not frames:
-            return pd.DataFrame()
-        return pd.concat(frames, ignore_index=True)
-
-    def get_historial_nemotecnico(
-        self,
-        nemotecnico: str,
-        fecha_inicio: FechaLike,
-        fecha_fin: FechaLike,
-        segmento: Optional[Segmento] = None,
-    ) -> pd.DataFrame:
-        """
-        Recorre día a día un rango y devuelve solo las filas del nemotécnico.
-        Ideal para reconstruir la trayectoria de un CDT / TES concreto.
-        """
-        return self.buscar(
-            nemotecnico=nemotecnico,
-            fecha_inicio=fecha_inicio,
-            fecha_fin=fecha_fin,
-            segmento=segmento,
-        )
-
-    # ------------------------------------------------------------------
-    # Internos
-    # ------------------------------------------------------------------
-
-    def _get(
-        self,
-        segmento: Segmento,
-        fecha: Optional[FechaLike] = None,
-        fecha_inicio: Optional[FechaLike] = None,
-        fecha_fin: Optional[FechaLike] = None,
-    ) -> pd.DataFrame:
-        # Normalizar rango
+    def get_deuda(self, segmento: Segmento | str, fecha: str | date | None = None) -> pd.DataFrame:
+        seg = self._coerce_segmento(segmento)
+        url = SEGMENTO_URLS[seg]
+        page = self._require_page()
+        logger.info("Consultando BVC: %s", url)
+        page.goto(url, wait_until="domcontentloaded")
+        page.wait_for_timeout(1200)
         if fecha is not None:
-            fechas = [_parse_fecha(fecha)]
-        elif fecha_inicio is not None and fecha_fin is not None:
-            ini = _parse_fecha(fecha_inicio)
-            fin = _parse_fecha(fecha_fin)
-            if ini > fin:
-                ini, fin = fin, ini
-            fechas = list(_daterange(ini, fin))
-        else:
-            fechas = [None]  # día actual de la página
-
-        frames = []
-        for f in fechas:
-            df = self._fetch_one(segmento, f)
-            if df is not None and not df.empty:
-                if f is not None:
-                    df = df.copy()
-                    df["Fecha_consulta"] = f.isoformat()
-                frames.append(df)
-        if not frames:
-            return pd.DataFrame()
-        return pd.concat(frames, ignore_index=True)
-
-    def _cache_path(self, segmento: Segmento, fecha: Optional[date]) -> Optional[Path]:
-        if not self.cache_dir:
-            return None
-        key = fecha.isoformat() if fecha else "hoy"
-        return self.cache_dir / f"{segmento}_{key}.parquet"
-
-    def _fetch_one(self, segmento: Segmento, fecha: Optional[date]) -> pd.DataFrame:
-        # Cache
-        path = self._cache_path(segmento, fecha)
-        if path and path.exists():
-            logger.info("Cache hit: %s", path.name)
-            return pd.read_parquet(path)
-
-        self._start()
-        assert self._browser is not None
-
-        page = self._browser.new_page()
-        try:
-            page.set_default_timeout(self.timeout)
-            page.goto(BASE_URL, wait_until="domcontentloaded")
-            page.wait_for_timeout(2000)
-
-            # Sub-pestaña
-            label = SEGMENTO_LABELS[segmento]
-            try:
-                page.get_by_text(label, exact=False).first.click(timeout=8000)
-                page.wait_for_timeout(1500)
-            except PlaywrightTimeout:
-                logger.warning("No se encontró la pestaña %s; se usa la vista actual", label)
-
-            if fecha is not None:
-                self._seleccionar_fecha(page, fecha)
-
-            page.wait_for_selector("table", timeout=12_000)
-            page.wait_for_timeout(1200)
-
-            html = page.content()
-            dfs = pd.read_html(io.StringIO(html))
-            if not dfs:
-                return pd.DataFrame()
-
-            df = None
-            for candidate in dfs:
-                cols = [str(c).lower() for c in candidate.columns]
-                if any("nemot" in c for c in cols):
-                    df = candidate
-                    break
-            if df is None:
-                df = max(dfs, key=lambda d: d.shape[0])
-
-            df = self._limpiar(df)
-
-            if path and not df.empty:
-                df.to_parquet(path, index=False)
-                logger.info("Cache saved: %s", path.name)
-
-            return df
-
-        except Exception as exc:
-            logger.error("Error scraping %s fecha=%s: %s", segmento, fecha, exc)
-            return pd.DataFrame()
-        finally:
-            page.close()
-
-    def _seleccionar_fecha(self, page: Page, target: date):
-        """Navega el date-picker React de la BVC."""
-        try:
-            # Abrir calendario
-            selectors = [
-                ".OCIcon__Svg-sc-hhr8al-0",
-                ".react-date-picker__calendar-button",
-                "[class*='date-picker'] button",
-                "[class*='DatePicker'] button",
-            ]
-            opened = False
-            for sel in selectors:
-                loc = page.locator(sel).first
-                if loc.count() > 0:
-                    loc.click()
-                    opened = True
-                    break
-            if not opened:
-                logger.warning("No se encontró botón de calendario")
-                return
+            fecha_d = _parse_fecha(fecha)
+            if fecha_d is None:
+                raise ValueError(f"Fecha inválida: {fecha!r}")
+            inputs = page.locator("input")
+            for i in range(inputs.count()):
+                item = inputs.nth(i)
+                placeholder = (item.get_attribute("placeholder") or "").lower()
+                name = (item.get_attribute("name") or "").lower()
+                if "fecha" in placeholder or "date" in placeholder or "fecha" in name or "date" in name:
+                    item.fill(fecha_d.strftime("%d/%m/%Y"))
             page.wait_for_timeout(700)
+        tables = page.locator("table")
+        rows: list[list[str]] = []
+        headers: list[str] = []
+        for ti in range(tables.count()):
+            table = tables.nth(ti)
+            ths = table.locator("thead th")
+            local_headers = [ths.nth(i).inner_text().strip() for i in range(ths.count())]
+            if not local_headers or not any(k in " ".join(local_headers).lower() for k in ("nemot", "título", "titulo", "vencimiento", "tasa", "precio")):
+                continue
+            trs = table.locator("tbody tr")
+            local_rows = []
+            for ri in range(trs.count()):
+                tds = trs.nth(ri).locator("td")
+                values = [tds.nth(i).inner_text().strip() for i in range(tds.count())]
+                if values:
+                    local_rows.append(values)
+            if local_rows:
+                headers, rows = local_headers, local_rows
+                break
+        if not rows:
+            logger.warning("BVC no devolvió filas de deuda para segmento=%s fecha=%s", seg.value, fecha)
+            return pd.DataFrame()
+        width = min(len(headers), min(len(row) for row in rows))
+        frame = pd.DataFrame([r[:width] for r in rows], columns=headers[:width])
+        frame["Segmento"] = seg.value
+        frame["Fecha_consulta"] = (_parse_fecha(fecha) or date.today()).isoformat()
+        return frame
 
-            # Vista de año
-            for nav_sel in (
-                ".DatePickerstyled__StyledNavigationLabel-sc-nz7bkq-2",
-                ".react-calendar__navigation__label",
-            ):
-                nav = page.locator(nav_sel).first
-                if nav.count() > 0:
-                    nav.click()
-                    break
-            page.wait_for_timeout(400)
+    def get_deuda_publica(self, fecha: str | date | None = None) -> pd.DataFrame:
+        return self.get_deuda(Segmento.DEUDA_PUBLICA_PUBLICA, fecha)
 
-            # Ajustar año
-            for _ in range(20):
-                label_loc = page.locator(
-                    ".react-calendar__navigation__label__labelText, .react-calendar__navigation__label"
-                ).first
-                label_text = label_loc.inner_text()
-                digits = "".join(filter(str.isdigit, label_text))
-                if len(digits) < 4:
-                    break
-                cur_year = int(digits[:4])
-                if cur_year == target.year:
-                    break
-                if cur_year > target.year:
-                    page.locator(
-                        "button.react-calendar__navigation__prev-button, "
-                        "button.react-calendar__navigation__arrow:nth-child(1)"
-                    ).first.click()
-                else:
-                    page.locator(
-                        "button.react-calendar__navigation__next-button, "
-                        "button.react-calendar__navigation__arrow:nth-child(3)"
-                    ).first.click()
-                page.wait_for_timeout(350)
+    def get_deuda_privada(self, fecha: str | date | None = None) -> pd.DataFrame:
+        return self.get_deuda(Segmento.DEUDA_PUBLICA_PRIVADA, fecha)
 
-            # Mes
-            month_btn = page.locator(
-                f"button.react-calendar__tile:nth-child({target.month})"
-            ).first
-            if month_btn.count() > 0:
-                month_btn.click()
-            page.wait_for_timeout(500)
+    def get_deuda_corporativa(self, fecha: str | date | None = None) -> pd.DataFrame:
+        return self.get_deuda(Segmento.DEUDA_CORPORATIVA, fecha)
 
-            # Día
-            day_buttons = page.locator("button.react-calendar__tile")
-            count = day_buttons.count()
-            for i in range(count):
-                btn = day_buttons.nth(i)
-                aria = btn.get_attribute("aria-label") or ""
-                text = btn.inner_text()
-                if (
-                    str(target.day) in aria
-                    and str(target.year) in aria
-                ) or (
-                    text.strip() == str(target.day)
-                    and "neighboring" not in (btn.get_attribute("class") or "")
-                ):
-                    btn.click()
-                    break
-            page.wait_for_timeout(2000)
+    def get_deuda_publica_segmento_publico(self, fecha: str | date | None = None) -> pd.DataFrame:
+        return self.get_deuda_publica(fecha)
 
-        except Exception as exc:
-            logger.warning(
-                "No se pudo cambiar la fecha a %s (%s). Se usa la fecha actual.",
-                target,
-                exc,
-            )
+    def get_detalle_titulo(self, nemotecnico: str, segmento: Segmento | str = Segmento.DEUDA_CORPORATIVA) -> dict[str, Any]:
+        """Consulta el detalle público de un título; no inventa una ficha si la consulta falla."""
+        seg = self._coerce_segmento(segmento)
+        page = self._require_page()
+        page.goto(SEGMENTO_URLS[seg], wait_until="domcontentloaded")
+        page.wait_for_timeout(800)
+        row = page.locator("tr").filter(has_text=nemotecnico).first
+        if row.count():
+            text = row.inner_text().strip()
+            if nemotecnico.lower() in text.lower():
+                cells = row.locator("th,td")
+                values = [cells.nth(i).inner_text().strip() for i in range(cells.count())]
+                return {"Nemotecnico": nemotecnico, "Segmento": seg.value, "Datos_fila": values, "Fuente_datos": "BVC", "Estado": "Fila visible; no equivale a ficha validada"}
+        return {"Nemotecnico": nemotecnico, "Segmento": seg.value, "Fuente_datos": None, "Estado": "No verificado: consulta a BVC sin resultado"}
 
-    @staticmethod
-    def _col_nemotecnico(df: pd.DataFrame) -> Optional[str]:
-        for c in df.columns:
-            if "nemot" in str(c).lower():
-                return c
-        return None
+    def get_operaciones_titulo(self, nemotecnico: str, fecha: str | date | None = None, segmento: Segmento | str = Segmento.DEUDA_CORPORATIVA) -> pd.DataFrame:
+        """Busca operaciones de un título si existe una tabla visible accesible en la página."""
+        seg = self._coerce_segmento(segmento)
+        page = self._require_page()
+        page.goto(SEGMENTO_URLS[seg], wait_until="domcontentloaded")
+        page.wait_for_timeout(800)
+        candidates = page.locator("table")
+        for ti in range(candidates.count()):
+            table = candidates.nth(ti)
+            if nemotecnico.lower() not in table.inner_text().lower():
+                continue
+            header_nodes = table.locator("thead th")
+            headers = [header_nodes.nth(i).inner_text().strip() for i in range(header_nodes.count())]
+            rows = []
+            trs = table.locator("tbody tr")
+            for ri in range(trs.count()):
+                row = trs.nth(ri)
+                td_nodes = row.locator("td")
+                values = [td_nodes.nth(i).inner_text().strip() for i in range(td_nodes.count())]
+                if values:
+                    rows.append(values)
+            width = min(len(headers), min((len(r) for r in rows), default=0)) if headers else 0
+            if width:
+                df = pd.DataFrame([r[:width] for r in rows], columns=headers[:width])
+                df["Nemotecnico"] = nemotecnico
+                df["Segmento"] = seg.value
+                df["Fuente_datos"] = "BVC"
+                return df
+        return pd.DataFrame()
 
-    @staticmethod
-    def _limpiar(df: pd.DataFrame) -> pd.DataFrame:
-        df = df.copy()
-        df.columns = [str(c).strip() for c in df.columns]
-        df = df.dropna(how="all").reset_index(drop=True)
+    def get_operaciones_dia(self, fecha: str | date | None = None) -> pd.DataFrame:
+        """No hay extracción consolidada intradía validada: no se simulan operaciones."""
+        logger.warning("No hay extracción consolidada de operaciones intradía BVC validada; se devuelve DataFrame vacío")
+        return pd.DataFrame(columns=["Fecha", "Nemotecnico", "Hora", "Tasa", "Precio", "Nominal", "Giro", "Fuente_datos"])
 
-        for col in df.columns:
-            if df[col].dtype == object:
-                sample = df[col].dropna().astype(str).head(8)
-                # Detectar números con separador de miles colombiano
-                if sample.str.contains(r"\d[\.,]\d").any():
-                    cleaned = (
-                        df[col]
-                        .astype(str)
-                        .str.replace(",", "", regex=False)
-                        .str.replace("%", "", regex=False)
-                        .str.strip()
-                    )
-                    numeric = pd.to_numeric(cleaned, errors="coerce")
-                    if numeric.notna().sum() > len(df) * 0.5:
-                        df[col] = numeric
-        return df
+
+BVCRentaFija = BVCClient
