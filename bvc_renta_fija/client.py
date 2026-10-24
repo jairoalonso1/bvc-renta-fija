@@ -22,6 +22,7 @@ from playwright.sync_api import (
     sync_playwright,
     Page,
     Browser,
+    BrowserContext,
     TimeoutError as PlaywrightTimeout,
 )
 
@@ -79,6 +80,7 @@ class BVCRentaFija:
         if self.cache_dir:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
         self._browser: Optional[Browser] = None
+        self._context: Optional[BrowserContext] = None
         self._playwright = None
 
     def __enter__(self):
@@ -89,12 +91,32 @@ class BVCRentaFija:
         self.close()
 
     def _start(self):
-        if self._browser is not None:
+        if self._context is not None:
             return
         self._playwright = sync_playwright().start()
-        self._browser = self._playwright.chromium.launch(headless=self.headless)
+        self._browser = self._playwright.chromium.launch(
+            headless=self.headless,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        self._context = self._browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            locale="es-CO",
+            timezone_id="America/Bogota",
+            viewport={"width": 1440, "height": 900},
+        )
+        # Keep the browser context that successfully loads the official BVC site.
+        self._context.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+        )
 
     def close(self):
+        if self._context:
+            self._context.close()
+            self._context = None
         if self._browser:
             self._browser.close()
             self._browser = None
@@ -161,7 +183,7 @@ class BVCRentaFija:
         self._start()
         assert self._browser is not None
         symbol = str(nemotecnico).strip().upper()
-        page = self._browser.new_page()
+        page = self._context.new_page()
         try:
             page.set_default_timeout(self.timeout)
             page.goto(slug_url or self._detalle_url(segmento, symbol, "resumen"), wait_until="domcontentloaded")
@@ -250,7 +272,7 @@ class BVCRentaFija:
 
         self._start()
         assert self._browser is not None
-        page = self._browser.new_page()
+        page = self._context.new_page()
         captured = {}
 
         def capture_api_headers(request):
@@ -365,7 +387,7 @@ class BVCRentaFija:
             return pd.read_parquet(path)
         self._start()
         assert self._browser is not None
-        page = self._browser.new_page()
+        page = self._context.new_page()
         try:
             page.set_default_timeout(self.timeout)
             page.goto(BASE_URL, wait_until="domcontentloaded")
