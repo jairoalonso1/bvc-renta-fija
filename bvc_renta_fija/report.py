@@ -1,9 +1,15 @@
 """
 Generación de reportes HTML visuales de renta fija BVC.
+
+Incluye:
+- Reporte general con tabla completa paginada (25 filas)
+- Columnas de listado + opcional Contado (Hora, Rueda, Tasa, …)
+- Reporte de deuda corporativa con visualización avanzada (Plotly)
 """
 from __future__ import annotations
 
 import json
+import math
 from datetime import date, datetime
 from pathlib import Path
 from typing import Optional, Union
@@ -13,6 +19,8 @@ import pandas as pd
 from .client import BVCRentaFija, Segmento, SEGMENTO_LABELS, _parse_fecha
 
 FechaLike = Union[str, date]
+
+PAGE_SIZE = 25
 
 
 def _find_col(df: pd.DataFrame, *keywords: str) -> Optional[str]:
@@ -40,18 +48,16 @@ def enriquecer(df: pd.DataFrame, fecha_ref: Optional[date] = None) -> pd.DataFra
     col_cant = _find_col(out, "cant")
     col_vol = _find_col(out, "vol")
 
-    # Prefijo (6 caracteres del nemotécnico) — útil para CDT (CDTBBO, CDTBCB…)
     if col_n:
         out["Prefijo"] = out[col_n].astype(str).str.upper().str[:6]
         out["Nemotecnico_norm"] = out[col_n].astype(str).str.upper().str.strip()
 
-    # Familia a partir de clase de título + prefijo
     def _familia(row) -> str:
         clase = str(row.get(col_c, "") or "").upper()
         pref = str(row.get("Prefijo", "") or "").upper()
         if "UVR" in clase or pref.startswith("TUVT"):
             return "TES UVR"
-        if "TES" in clase or pref.startswith(("TFIT", "TCO", "TFIT")):
+        if "TES" in clase or pref.startswith(("TFIT", "TCO")):
             return "TES Tasa Fija / Descuento"
         if "TIDIS" in clase or pref.startswith("TIDIS"):
             return "TIDIS"
@@ -67,7 +73,6 @@ def enriquecer(df: pd.DataFrame, fecha_ref: Optional[date] = None) -> pd.DataFra
 
     out["Familia"] = out.apply(_familia, axis=1)
 
-    # Bucket de vencimiento
     ref = fecha_ref or date.today()
 
     def _bucket(val) -> str:
@@ -106,33 +111,76 @@ def enriquecer(df: pd.DataFrame, fecha_ref: Optional[date] = None) -> pd.DataFra
 
     if col_v:
         out["Bucket_vencimiento"] = out[col_v].apply(_bucket)
-    else:
-        out["Bucket_vencimiento"] = "Sin fecha"
 
-    # Asegurar numéricos
-    for c, name in ((col_cant, "Cantidad_num"), (col_vol, "Volumen_num")):
-        if c and c in out.columns:
-            s = out[c]
-            if s.dtype == object:
-                s = (
-                    s.astype(str)
-                    .str.replace(".", "", regex=False)
-                    .str.replace(",", ".", regex=False)
-                    .str.replace("%", "", regex=False)
-                )
-                out[name] = pd.to_numeric(s, errors="coerce")
-            else:
-                out[name] = pd.to_numeric(s, errors="coerce")
-        else:
-            out[name] = 0.0
+        def _years(val):
+            try:
+                if isinstance(val, datetime):
+                    v = val.date()
+                elif isinstance(val, date):
+                    v = val
+                else:
+                    s = str(val).strip().replace("-", "/")
+                    v = None
+                    for fmt in ("%Y/%m/%d", "%d/%m/%Y", "%Y-%m-%d"):
+                        try:
+                            v = datetime.strptime(s, fmt).date()
+                            break
+                        except ValueError:
+                            continue
+                    if v is None:
+                        return None
+                return round((v - ref).days / 365.25, 2)
+            except Exception:
+                return None
 
-    out["Cantidad_num"] = out["Cantidad_num"].fillna(0)
-    out["Volumen_num"] = out["Volumen_num"].fillna(0)
+        out["Anios_vencimiento"] = out[col_v].apply(_years)
+
+    def _num(series):
+        return pd.to_numeric(
+            series.astype(str)
+            .str.replace(",", "", regex=False)
+            .str.replace("%", "", regex=False)
+            .str.strip(),
+            errors="coerce",
+        )
+
+    out["Cantidad_num"] = _num(out[col_cant]) if col_cant else 0.0
+    out["Volumen_num"] = _num(out[col_vol]) if col_vol else 0.0
+
+    # Tipo de tasa a partir de columnas del listado (si existen)
+    col_tasa = _find_col(out, "tasa")
+    col_idx = _find_col(out, "indice")
+    col_per = _find_col(out, "period")
+
+    def _tipo_tasa(row) -> str:
+        tasa = str(row.get(col_tasa, "") or "").strip() if col_tasa else ""
+        idx = str(row.get(col_idx, "") or "").strip() if col_idx else ""
+        per = str(row.get(col_per, "") or "").strip() if col_per else ""
+        fam = str(row.get("Familia", "") or "")
+        if idx and idx.upper() not in ("NAN", "NONE", "-", ""):
+            return f"Indexada ({idx})"
+        if tasa and tasa.upper() not in ("NAN", "NONE", "-", ""):
+            try:
+                float(tasa.replace(",", "."))
+                return "Tasa fija"
+            except ValueError:
+                return tasa[:40]
+        if "UVR" in fam:
+            return "UVR"
+        if "CDT" in fam:
+            return "CDT"
+        if per and per.upper() not in ("NAN", "NONE", "-", ""):
+            return per[:40]
+        return "No clasificado"
+
+    out["Tipo_tasa"] = out.apply(_tipo_tasa, axis=1)
     return out
 
 
-def _fmt_cop(x: float) -> str:
-    if pd.isna(x):
+def _fmt_cop(x) -> str:
+    try:
+        x = float(x)
+    except (TypeError, ValueError):
         return "—"
     abs_x = abs(x)
     if abs_x >= 1e12:
@@ -145,10 +193,14 @@ def _fmt_cop(x: float) -> str:
 
 
 def _agg_table(df: pd.DataFrame, by: str) -> pd.DataFrame:
+    if by not in df.columns or df.empty:
+        return pd.DataFrame()
     g = (
         df.groupby(by, dropna=False)
         .agg(
-            Titulos=("Nemotecnico_norm", "nunique") if "Nemotecnico_norm" in df.columns else ("Volumen_num", "count"),
+            Titulos=("Nemotecnico_norm", "nunique")
+            if "Nemotecnico_norm" in df.columns
+            else ("Volumen_num", "count"),
             Volumen=("Volumen_num", "sum"),
             Cantidad=("Cantidad_num", "sum"),
         )
@@ -160,6 +212,93 @@ def _agg_table(df: pd.DataFrame, by: str) -> pd.DataFrame:
     return g
 
 
+def _periodo_label(fecha, fecha_inicio, fecha_fin) -> str:
+    if fecha:
+        return str(fecha)
+    if fecha_inicio and fecha_fin:
+        return f"{fecha_inicio} → {fecha_fin}"
+    return "sesión actual"
+
+
+def _chart_data(df: pd.DataFrame, label_col: str):
+    if df is None or df.empty or label_col not in df.columns:
+        return [], []
+    labels = [str(x) for x in df[label_col].tolist()]
+    values = [round(float(v) / 1e9, 3) for v in df["Volumen"].tolist()]  # miles de millones
+    return labels, values
+
+
+def _table_html(df: pd.DataFrame, label_col: str) -> str:
+    if df is None or df.empty:
+        return ""
+    rows = []
+    for _, r in df.iterrows():
+        rows.append(
+            f"<tr><td>{r[label_col]}</td>"
+            f"<td class=\"num\">{int(r.get('Titulos', 0))}</td>"
+            f"<td class=\"num\">{_fmt_cop(r['Volumen'])}</td>"
+            f"<td class=\"num\">{r.get('Participacion_%', 0):.1f}%</td></tr>"
+        )
+    return "\n".join(rows)
+
+
+def _render_empty(titulo_seg, fecha, fecha_inicio, fecha_fin) -> str:
+    periodo = _periodo_label(fecha, fecha_inicio, fecha_fin)
+    return f"""<!DOCTYPE html>
+<html lang="es"><head><meta charset="utf-8"/><title>Reporte vacío · {periodo}</title>
+<style>body{{font-family:system-ui;background:#0b1220;color:#e5e7eb;padding:2rem}}
+.card{{background:#111827;border-radius:12px;padding:1.5rem;max-width:640px}}</style></head>
+<body><div class="card"><h1>Sin datos</h1>
+<p>{titulo_seg} · {periodo}</p>
+<p>La BVC no devolvió operaciones para este periodo (día no bursátil o sin movimientos).</p>
+</div></body></html>"""
+
+
+def _detalle_rows_json(df: pd.DataFrame) -> list:
+    """Serializa todas las filas del listado para paginación en el cliente."""
+    if df is None or df.empty:
+        return []
+    det = df.sort_values("Volumen_num", ascending=False)
+    col_n = _find_col(det, "nemot") or "Nemotecnico_norm"
+    col_e = _find_col(det, "emisor") or "Emisor"
+    col_v = _find_col(det, "venc") or "Bucket_vencimiento"
+    col_tasa = _find_col(det, "tasa")
+    rows = []
+    for _, r in det.iterrows():
+        rows.append({
+            "nemotecnico": str(r.get(col_n, "") or ""),
+            "emisor": str(r.get(col_e, "") or ""),
+            "familia": str(r.get("Familia", "") or ""),
+            "vencimiento": str(r.get(col_v, "") or ""),
+            "bucket": str(r.get("Bucket_vencimiento", "") or ""),
+            "tipo_tasa": str(r.get("Tipo_tasa", "") or ""),
+            "tasa": str(r.get(col_tasa, "") or "") if col_tasa else "",
+            "cantidad": _fmt_cop(r.get("Cantidad_num", 0)),
+            "volumen": _fmt_cop(r.get("Volumen_num", 0)),
+            "volumen_num": float(r.get("Volumen_num", 0) or 0),
+        })
+    return rows
+
+
+def _ops_rows_json(ops: pd.DataFrame) -> list:
+    if ops is None or ops.empty:
+        return []
+    rows = []
+    for _, r in ops.iterrows():
+        rows.append({
+            "hora": str(r.get("Hora", "") or ""),
+            "rueda": str(r.get("Rueda", "") or ""),
+            "nemotecnico": str(r.get("Nemotecnico", "") or ""),
+            "precio": str(r.get("Precio", "") or ""),
+            "tasa": str(r.get("Tasa", "") or ""),
+            "cantidad": str(r.get("Cantidad", "") or ""),
+            "volumen": str(r.get("Volúmenes", r.get("Volumen", "")) or ""),
+            "procedencia": str(r.get("Procedencia", "") or ""),
+            "segmento": str(r.get("Segmento", "") or ""),
+        })
+    return rows
+
+
 def generar_reporte_html(
     fecha: Optional[FechaLike] = None,
     fecha_inicio: Optional[FechaLike] = None,
@@ -169,30 +308,20 @@ def generar_reporte_html(
     headless: bool = True,
     cache_dir: Optional[str | Path] = "./cache",
     top_n: int = 15,
+    include_operaciones: bool = False,
+    max_titulos_ops: int = 15,
+    page_size: int = PAGE_SIZE,
 ) -> Path:
     """
     Genera un reporte HTML visual de renta fija BVC.
 
-    Parameters
-    ----------
-    fecha :
-        Día concreto (YYYY-MM-DD). Si se omite y no hay rango, usa el día actual de la BVC.
-    fecha_inicio, fecha_fin :
-        Rango de fechas (alternativa a `fecha`).
-    segmento :
-        Uno de: deuda_publica_segmento_publico | deuda_publica_segmento_privado | deuda_corporativa.
-        Si es None, consolida los tres.
-    output_path :
-        Ruta del archivo HTML de salida.
-    top_n :
-        Cuántos emisores / prefijos mostrar en rankings.
-
-    Returns
-    -------
-    Path del HTML generado.
+    - Tabla de **todas** las filas del listado, con paginación cada `page_size` (25).
+    - Si `include_operaciones=True`, consulta Contado (Hora, Rueda, Tasa, …)
+      para hasta `max_titulos_ops` títulos (más lento).
     """
     output_path = Path(output_path)
 
+    ops = pd.DataFrame()
     with BVCRentaFija(headless=headless, cache_dir=cache_dir) as client:
         if segmento:
             df = client._get(
@@ -210,6 +339,17 @@ def generar_reporte_html(
             )
             titulo_seg = "Todos los segmentos"
 
+        if include_operaciones and not df.empty:
+            seg_ops = segmento or "deuda_corporativa"
+            try:
+                ops = client.get_operaciones_dia(
+                    fecha=fecha,
+                    segmento=seg_ops,
+                    max_titulos=max_titulos_ops,
+                )
+            except Exception:
+                ops = pd.DataFrame()
+
     ref = _parse_fecha(fecha) if fecha else (
         _parse_fecha(fecha_fin) if fecha_fin else date.today()
     )
@@ -220,28 +360,26 @@ def generar_reporte_html(
         output_path.write_text(html, encoding="utf-8")
         return output_path
 
-    # Agregaciones
     by_familia = _agg_table(df, "Familia")
     by_bucket = _agg_table(df, "Bucket_vencimiento")
-    # Orden lógico de buckets
     order_b = ["Vencido", "< 1 año", "1–3 años", "3–5 años", "5–10 años", "> 10 años", "Sin fecha"]
-    by_bucket["_ord"] = by_bucket["Bucket_vencimiento"].apply(
-        lambda x: order_b.index(x) if x in order_b else 99
-    )
-    by_bucket = by_bucket.sort_values("_ord").drop(columns="_ord")
+    if not by_bucket.empty:
+        by_bucket["_ord"] = by_bucket["Bucket_vencimiento"].apply(
+            lambda x: order_b.index(x) if x in order_b else 99
+        )
+        by_bucket = by_bucket.sort_values("_ord").drop(columns="_ord")
 
     col_e = _find_col(df, "emisor")
     by_emisor = _agg_table(df, col_e) if col_e else pd.DataFrame()
     if not by_emisor.empty:
         by_emisor = by_emisor.head(top_n)
-
     by_prefijo = _agg_table(df, "Prefijo").head(top_n)
+    by_tasa = _agg_table(df, "Tipo_tasa")
 
     vol_total = float(df["Volumen_num"].sum())
     cant_total = float(df["Cantidad_num"].sum())
     n_titulos = int(df["Nemotecnico_norm"].nunique()) if "Nemotecnico_norm" in df.columns else len(df)
     n_ops = len(df)
-
     periodo = _periodo_label(fecha, fecha_inicio, fecha_fin)
 
     html = _render_html(
@@ -255,47 +393,90 @@ def generar_reporte_html(
         by_bucket=by_bucket,
         by_emisor=by_emisor,
         by_prefijo=by_prefijo,
+        by_tasa=by_tasa,
         detalle=df,
+        ops=ops,
         top_n=top_n,
+        page_size=page_size,
     )
     output_path.write_text(html, encoding="utf-8")
     return output_path
 
 
-def _periodo_label(fecha, fecha_inicio, fecha_fin) -> str:
-    if fecha:
-        return str(fecha)
-    if fecha_inicio and fecha_fin:
-        return f"{fecha_inicio} → {fecha_fin}"
-    return "Sesión actual (BVC)"
+def generar_reporte_corporativa(
+    fecha: Optional[FechaLike] = None,
+    output_path: str | Path = "reporte_corporativa.html",
+    headless: bool = True,
+    cache_dir: Optional[str | Path] = "./cache",
+    max_titulos_detalle: int = 25,
+    include_operaciones: bool = True,
+    max_titulos_ops: int = 12,
+) -> Path:
+    """
+    Informe enfocado en deuda corporativa con visualización avanzada:
 
+    - Eje de plazos (buckets / años a vencimiento)
+    - Volumen por nemotécnico
+    - Desglose por tipo de tasa (listado + ficha cuando esté disponible)
+    - Tabla completa paginada
+    - Opcional: operaciones Contado (Hora, Rueda, Tasa, Cantidad)
+    """
+    output_path = Path(output_path)
+    fecha = fecha or date.today().isoformat()
 
-def _render_empty(titulo_seg, fecha, fecha_inicio, fecha_fin) -> str:
-    periodo = _periodo_label(fecha, fecha_inicio, fecha_fin)
-    return f"""<!DOCTYPE html>
-<html lang="es"><head><meta charset="utf-8"><title>Reporte Renta Fija BVC</title>
-<style>body{{font-family:system-ui;background:#0f172a;color:#e2e8f0;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}}
-.card{{background:#1e293b;padding:2rem 3rem;border-radius:16px;text-align:center}}</style></head>
-<body><div class="card"><h1>Sin datos</h1><p>{titulo_seg} · {periodo}</p>
-<p>No se encontraron operaciones para los filtros indicados.</p></div></body></html>"""
+    fichas = []
+    ops = pd.DataFrame()
+    with BVCRentaFija(headless=headless, cache_dir=cache_dir) as client:
+        df = client.get_deuda_corporativa(fecha=fecha)
+        df = enriquecer(df, fecha_ref=_parse_fecha(fecha))
 
+        if not df.empty and "Nemotecnico_norm" in df.columns:
+            top = (
+                df.sort_values("Volumen_num", ascending=False)["Nemotecnico_norm"]
+                .dropna()
+                .astype(str)
+                .unique()
+                .tolist()[:max_titulos_detalle]
+            )
+            for n in top:
+                try:
+                    ficha = client.get_detalle_titulo(n, segmento="deuda_corporativa")
+                    detalle = ficha.get("Detalle") or {}
+                    tipo = (
+                        detalle.get("Tipo de tasa")
+                        or detalle.get("Tasa")
+                        or detalle.get("Modalidad")
+                        or detalle.get("Periodicidad")
+                        or ""
+                    )
+                    fichas.append({"Nemotecnico": n, "Tipo_tasa_ficha": str(tipo)[:60], **{f"f_{k}": v for k, v in list(detalle.items())[:12]}})
+                except Exception:
+                    continue
 
-def _chart_data(df: pd.DataFrame, label_col: str) -> tuple[list, list]:
-    labels = df[label_col].astype(str).tolist()
-    values = [round(float(v) / 1e9, 2) for v in df["Volumen"].tolist()]  # en miles de millones
-    return labels, values
+        if include_operaciones and not df.empty:
+            try:
+                ops = client.get_operaciones_dia(
+                    fecha=fecha,
+                    segmento="deuda_corporativa",
+                    max_titulos=max_titulos_ops,
+                )
+            except Exception:
+                ops = pd.DataFrame()
 
+    if df.empty:
+        html = _render_empty("Deuda corporativa", fecha, None, None)
+        output_path.write_text(html, encoding="utf-8")
+        return output_path
 
-def _table_html(df: pd.DataFrame, label_col: str) -> str:
-    rows = []
-    for _, r in df.iterrows():
-        rows.append(
-            f"<tr><td>{r[label_col]}</td>"
-            f"<td class=\"num\">{int(r.get('Titulos', 0))}</td>"
-            f"<td class=\"num\">{_fmt_cop(r['Volumen'])}</td>"
-            f"<td class=\"num\">{r.get('Participacion_%', 0):.1f}%</td></tr>"
-        )
-    return "\n".join(rows)
+    if fichas:
+        fdf = pd.DataFrame(fichas)
+        df = df.merge(fdf[["Nemotecnico", "Tipo_tasa_ficha"]], left_on="Nemotecnico_norm", right_on="Nemotecnico", how="left")
+        df["Tipo_tasa"] = df["Tipo_tasa_ficha"].fillna(df.get("Tipo_tasa", "No clasificado"))
+        df["Tipo_tasa"] = df["Tipo_tasa"].replace("", "No clasificado")
+
+    html = _render_corporativa(df, ops, fecha)
+    output_path.write_text(html, encoding="utf-8")
+    return output_path
 
 
 def _render_html(
@@ -310,35 +491,21 @@ def _render_html(
     by_bucket,
     by_emisor,
     by_prefijo,
+    by_tasa,
     detalle,
+    ops,
     top_n,
+    page_size,
 ) -> str:
     fam_l, fam_v = _chart_data(by_familia, "Familia")
     buck_l, buck_v = _chart_data(by_bucket, "Bucket_vencimiento")
     pref_l, pref_v = _chart_data(by_prefijo, "Prefijo") if not by_prefijo.empty else ([], [])
     em_col = by_emisor.columns[0] if not by_emisor.empty else "Emisor"
     em_l, em_v = _chart_data(by_emisor, em_col) if not by_emisor.empty else ([], [])
+    tasa_l, tasa_v = _chart_data(by_tasa, "Tipo_tasa") if not by_tasa.empty else ([], [])
 
-    # Top detalle por volumen
-    det = detalle.sort_values("Volumen_num", ascending=False).head(25)
-    col_n = _find_col(det, "nemot") or "Nemotecnico_norm"
-    col_e = _find_col(det, "emisor") or "Emisor"
-    col_c = _find_col(det, "clase") or "Familia"
-    col_v = _find_col(det, "venc") or "Bucket_vencimiento"
-
-    det_rows = []
-    for _, r in det.iterrows():
-        det_rows.append(
-            f"<tr>"
-            f"<td><code>{r.get(col_n, '')}</code></td>"
-            f"<td>{r.get(col_e, '')}</td>"
-            f"<td>{r.get('Familia', r.get(col_c, ''))}</td>"
-            f"<td>{r.get(col_v, '')}</td>"
-            f"<td>{r.get('Bucket_vencimiento', '')}</td>"
-            f"<td class=\"num\">{_fmt_cop(r['Volumen_num'])}</td>"
-            f"</tr>"
-        )
-
+    detalle_json = json.dumps(_detalle_rows_json(detalle), ensure_ascii=False)
+    ops_json = json.dumps(_ops_rows_json(ops), ensure_ascii=False)
     generated = datetime.now().strftime("%Y-%m-%d %H:%M")
 
     return f"""<!DOCTYPE html>
@@ -350,70 +517,48 @@ def _render_html(
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <style>
 :root {{
-  --bg: #0b1220;
-  --card: #111827;
-  --border: #1f2937;
-  --text: #e5e7eb;
-  --muted: #9ca3af;
-  --accent: #38bdf8;
-  --accent2: #a78bfa;
-  --good: #34d399;
+  --bg: #0b1220; --card: #111827; --border: #1f2937;
+  --text: #e5e7eb; --muted: #9ca3af; --accent: #38bdf8; --accent2: #a78bfa;
 }}
 * {{ box-sizing: border-box; }}
 body {{
-  margin: 0;
-  font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+  margin: 0; font-family: "Segoe UI", system-ui, sans-serif;
   background: radial-gradient(1200px 600px at 10% -10%, #1e3a5f 0%, transparent 50%),
-              radial-gradient(900px 500px at 100% 0%, #312e81 0%, transparent 45%),
-              var(--bg);
-  color: var(--text);
-  line-height: 1.45;
-  min-height: 100vh;
+              radial-gradient(900px 500px at 100% 0%, #312e81 0%, transparent 45%), var(--bg);
+  color: var(--text); line-height: 1.45; min-height: 100vh;
 }}
 .wrap {{ max-width: 1180px; margin: 0 auto; padding: 2rem 1.25rem 3rem; }}
-header {{
-  display: flex; flex-wrap: wrap; justify-content: space-between; gap: 1rem;
-  align-items: flex-end; margin-bottom: 1.75rem;
-}}
+header {{ display: flex; flex-wrap: wrap; justify-content: space-between; gap: 1rem; align-items: flex-end; margin-bottom: 1.75rem; }}
 h1 {{ margin: 0; font-size: 1.75rem; letter-spacing: -0.02em; }}
 .sub {{ color: var(--muted); font-size: 0.95rem; margin-top: 0.25rem; }}
-.badge {{
-  background: linear-gradient(135deg, #0ea5e9, #6366f1);
-  color: white; font-size: 0.75rem; font-weight: 600;
-  padding: 0.35rem 0.75rem; border-radius: 999px;
-}}
-.kpis {{
-  display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-  gap: 1rem; margin-bottom: 1.5rem;
-}}
-.kpi {{
-  background: var(--card); border: 1px solid var(--border);
-  border-radius: 14px; padding: 1.1rem 1.25rem;
-}}
+.badge {{ background: #1e293b; border: 1px solid var(--border); padding: 0.35rem 0.75rem; border-radius: 999px; font-size: 0.8rem; color: var(--muted); }}
+.kpis {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 1rem; margin-bottom: 1.5rem; }}
+@media (max-width: 860px) {{ .kpis {{ grid-template-columns: 1fr 1fr; }} }}
+.kpi {{ background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 1rem 1.15rem; }}
 .kpi .label {{ color: var(--muted); font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.04em; }}
-.kpi .value {{ font-size: 1.45rem; font-weight: 700; margin-top: 0.35rem; color: var(--accent); }}
-.grid {{
-  display: grid; grid-template-columns: 1fr 1fr; gap: 1.25rem; margin-bottom: 1.25rem;
-}}
+.kpi .value {{ font-size: 1.35rem; font-weight: 700; margin-top: 0.35rem; color: var(--accent); }}
+.grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 1.25rem; margin-bottom: 1.25rem; }}
 @media (max-width: 860px) {{ .grid {{ grid-template-columns: 1fr; }} }}
-.card {{
-  background: var(--card); border: 1px solid var(--border);
-  border-radius: 16px; padding: 1.25rem 1.35rem;
-}}
+.card {{ background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 1.25rem 1.35rem; }}
 .card h2 {{ margin: 0 0 1rem; font-size: 1.05rem; font-weight: 600; }}
 .chart-box {{ position: relative; height: 260px; }}
-table {{
-  width: 100%; border-collapse: collapse; font-size: 0.88rem;
-}}
-th, td {{ padding: 0.55rem 0.6rem; text-align: left; border-bottom: 1px solid var(--border); }}
-th {{ color: var(--muted); font-weight: 600; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.03em; }}
+table {{ width: 100%; border-collapse: collapse; font-size: 0.85rem; }}
+th, td {{ padding: 0.5rem 0.55rem; text-align: left; border-bottom: 1px solid var(--border); }}
+th {{ color: var(--muted); font-weight: 600; font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.03em; }}
 td.num {{ text-align: right; font-variant-numeric: tabular-nums; }}
-code {{
-  background: #1e293b; padding: 0.15rem 0.4rem; border-radius: 4px;
-  font-size: 0.82rem; color: #7dd3fc;
-}}
+code {{ background: #1e293b; padding: 0.12rem 0.35rem; border-radius: 4px; font-size: 0.8rem; color: #7dd3fc; }}
 .full {{ grid-column: 1 / -1; }}
+.pager {{ display: flex; gap: 0.5rem; align-items: center; justify-content: flex-end; margin-top: 0.85rem; flex-wrap: wrap; }}
+.pager button {{
+  background: #1e293b; border: 1px solid var(--border); color: var(--text);
+  padding: 0.35rem 0.75rem; border-radius: 8px; cursor: pointer;
+}}
+.pager button:disabled {{ opacity: 0.4; cursor: not-allowed; }}
+.pager .info {{ color: var(--muted); font-size: 0.85rem; margin-right: auto; }}
 footer {{ margin-top: 2rem; color: var(--muted); font-size: 0.8rem; text-align: center; }}
+.tabs {{ display: flex; gap: 0.5rem; margin-bottom: 0.75rem; }}
+.tabs button {{ background: transparent; border: 1px solid var(--border); color: var(--muted); padding: 0.4rem 0.9rem; border-radius: 999px; cursor: pointer; }}
+.tabs button.active {{ background: #1e3a5f; color: var(--accent); border-color: #334155; }}
 </style>
 </head>
 <body>
@@ -435,7 +580,7 @@ footer {{ margin-top: 2rem; color: var(--muted); font-size: 0.8rem; text-align: 
 
   <section class="grid">
     <div class="card">
-      <h2>Volumen por familia / tipo de título</h2>
+      <h2>Volumen por familia</h2>
       <div class="chart-box"><canvas id="chartFamilia"></canvas></div>
     </div>
     <div class="card">
@@ -446,75 +591,144 @@ footer {{ margin-top: 2rem; color: var(--muted); font-size: 0.8rem; text-align: 
 
   <section class="grid">
     <div class="card">
-      <h2>Top prefijos de nemotécnico (6 caracteres)</h2>
-      <p class="sub" style="margin-top:-0.5rem;margin-bottom:0.75rem">Útil para CDT: CDTBBO, CDTBCB, etc.</p>
+      <h2>Top prefijos</h2>
       <div class="chart-box"><canvas id="chartPrefijo"></canvas></div>
-      <table style="margin-top:1rem">
-        <thead><tr><th>Prefijo</th><th>Títulos</th><th>Volumen</th><th>%</th></tr></thead>
-        <tbody>
-        {_table_html(by_prefijo, "Prefijo")}
-        </tbody>
-      </table>
+      <table style="margin-top:1rem"><thead><tr><th>Prefijo</th><th>Títulos</th><th>Volumen</th><th>%</th></tr></thead>
+      <tbody>{_table_html(by_prefijo, "Prefijo")}</tbody></table>
     </div>
     <div class="card">
       <h2>Top emisores</h2>
       <div class="chart-box"><canvas id="chartEmisor"></canvas></div>
-      <table style="margin-top:1rem">
-        <thead><tr><th>Emisor</th><th>Títulos</th><th>Volumen</th><th>%</th></tr></thead>
-        <tbody>
-        {_table_html(by_emisor, em_col) if not by_emisor.empty else ""}
-        </tbody>
-      </table>
+      <table style="margin-top:1rem"><thead><tr><th>Emisor</th><th>Títulos</th><th>Volumen</th><th>%</th></tr></thead>
+      <tbody>{_table_html(by_emisor, em_col) if not by_emisor.empty else ""}</tbody></table>
     </div>
   </section>
 
   <section class="grid">
     <div class="card full">
-      <h2>Detalle por familia</h2>
-      <table>
-        <thead><tr><th>Familia</th><th>Títulos</th><th>Volumen</th><th>%</th></tr></thead>
-        <tbody>{_table_html(by_familia, "Familia")}</tbody>
-      </table>
+      <h2>Volumen por tipo de tasa</h2>
+      <div class="chart-box" style="height:220px"><canvas id="chartTasa"></canvas></div>
+      <table style="margin-top:1rem"><thead><tr><th>Tipo de tasa</th><th>Títulos</th><th>Volumen</th><th>%</th></tr></thead>
+      <tbody>{_table_html(by_tasa, "Tipo_tasa")}</tbody></table>
     </div>
   </section>
 
   <section class="grid">
     <div class="card full">
-      <h2>Top 25 operaciones por volumen</h2>
-      <table>
-        <thead>
-          <tr>
-            <th>Nemotécnico</th><th>Emisor</th><th>Familia</th>
-            <th>Vencimiento</th><th>Bucket</th><th>Volumen</th>
-          </tr>
-        </thead>
-        <tbody>
-        {''.join(det_rows)}
-        </tbody>
-      </table>
+      <h2>Detalle del listado (todas las filas)</h2>
+      <p class="sub" style="margin-top:-0.5rem">Paginado de {page_size} en {page_size}. Ordenado por volumen descendente.</p>
+      <div class="tabs">
+        <button type="button" class="active" id="tabListado" onclick="showTab('listado')">Listado BVC</button>
+        <button type="button" id="tabOps" onclick="showTab('ops')">Operaciones Contado</button>
+      </div>
+      <div id="panelListado">
+        <table>
+          <thead>
+            <tr>
+              <th>Nemotécnico</th><th>Emisor</th><th>Familia</th><th>Vencimiento</th>
+              <th>Bucket</th><th>Tipo tasa</th><th>Tasa</th><th>Cantidad</th><th>Volumen</th>
+            </tr>
+          </thead>
+          <tbody id="tbodyListado"></tbody>
+        </table>
+        <div class="pager">
+          <span class="info" id="infoListado"></span>
+          <button type="button" id="prevListado" onclick="pageListado(-1)">Anterior</button>
+          <button type="button" id="nextListado" onclick="pageListado(1)">Siguiente</button>
+        </div>
+      </div>
+      <div id="panelOps" style="display:none">
+        <p class="sub">Datos de Contado (Hora, Rueda, Tasa…) cuando se generó con <code>include_operaciones=True</code>.</p>
+        <table>
+          <thead>
+            <tr>
+              <th>Hora</th><th>Rueda</th><th>Nemotécnico</th><th>Precio</th>
+              <th>Tasa</th><th>Cantidad</th><th>Volumen</th><th>Procedencia</th>
+            </tr>
+          </thead>
+          <tbody id="tbodyOps"></tbody>
+        </table>
+        <div class="pager">
+          <span class="info" id="infoOps"></span>
+          <button type="button" id="prevOps" onclick="pageOps(-1)">Anterior</button>
+          <button type="button" id="nextOps" onclick="pageOps(1)">Siguiente</button>
+        </div>
+      </div>
     </div>
   </section>
 
   <footer>
-    Fuente: Bolsa de Valores de Colombia (Mercado en Línea) · Generado con bvc-renta-fija
+    Fuente: Bolsa de Valores de Colombia · Generado con bvc-renta-fija
   </footer>
 </div>
 
 <script>
-const colors = [
-  '#38bdf8','#a78bfa','#34d399','#fbbf24','#f472b6',
-  '#60a5fa','#c084fc','#2dd4bf','#fb923c','#e879f9'
-];
+const PAGE = {page_size};
+const DETALLE = {detalle_json};
+const OPS = {ops_json};
+let pageL = 0, pageO = 0;
+
+function showTab(which) {{
+  document.getElementById('panelListado').style.display = which === 'listado' ? '' : 'none';
+  document.getElementById('panelOps').style.display = which === 'ops' ? '' : 'none';
+  document.getElementById('tabListado').classList.toggle('active', which === 'listado');
+  document.getElementById('tabOps').classList.toggle('active', which === 'ops');
+}}
+
+function renderListado() {{
+  const start = pageL * PAGE;
+  const slice = DETALLE.slice(start, start + PAGE);
+  const tb = document.getElementById('tbodyListado');
+  tb.innerHTML = slice.map(r => `<tr>
+    <td><code>${{r.nemotecnico}}</code></td>
+    <td>${{r.emisor}}</td>
+    <td>${{r.familia}}</td>
+    <td>${{r.vencimiento}}</td>
+    <td>${{r.bucket}}</td>
+    <td>${{r.tipo_tasa}}</td>
+    <td class="num">${{r.tasa}}</td>
+    <td class="num">${{r.cantidad}}</td>
+    <td class="num">${{r.volumen}}</td>
+  </tr>`).join('') || '<tr><td colspan="9">Sin filas</td></tr>';
+  const total = DETALLE.length;
+  const pages = Math.max(1, Math.ceil(total / PAGE));
+  document.getElementById('infoListado').textContent =
+    total ? `Filas ${{start + 1}}–${{Math.min(start + PAGE, total)}} de ${{total}} · Página ${{pageL + 1}}/${{pages}}` : 'Sin datos';
+  document.getElementById('prevListado').disabled = pageL <= 0;
+  document.getElementById('nextListado').disabled = start + PAGE >= total;
+}}
+
+function renderOps() {{
+  const start = pageO * PAGE;
+  const slice = OPS.slice(start, start + PAGE);
+  const tb = document.getElementById('tbodyOps');
+  tb.innerHTML = slice.map(r => `<tr>
+    <td>${{r.hora}}</td><td>${{r.rueda}}</td>
+    <td><code>${{r.nemotecnico}}</code></td>
+    <td class="num">${{r.precio}}</td><td class="num">${{r.tasa}}</td>
+    <td class="num">${{r.cantidad}}</td><td class="num">${{r.volumen}}</td>
+    <td>${{r.procedencia}}</td>
+  </tr>`).join('') || '<tr><td colspan="8">Sin operaciones Contado (genera con include_operaciones=True)</td></tr>';
+  const total = OPS.length;
+  const pages = Math.max(1, Math.ceil(total / PAGE) || 1);
+  document.getElementById('infoOps').textContent =
+    total ? `Ops ${{start + 1}}–${{Math.min(start + PAGE, total)}} de ${{total}} · Página ${{pageO + 1}}/${{pages}}` : 'Sin operaciones Contado en este reporte';
+  document.getElementById('prevOps').disabled = pageO <= 0;
+  document.getElementById('nextOps').disabled = start + PAGE >= total;
+}}
+
+function pageListado(d) {{ pageL = Math.max(0, pageL + d); renderListado(); }}
+function pageOps(d) {{ pageO = Math.max(0, pageO + d); renderOps(); }}
+
+renderListado();
+renderOps();
+
+const colors = ['#38bdf8','#a78bfa','#34d399','#fbbf24','#f472b6','#60a5fa','#c084fc','#2dd4bf','#fb923c','#e879f9'];
 const commonOpts = {{
-  responsive: true,
-  maintainAspectRatio: false,
+  responsive: true, maintainAspectRatio: false,
   plugins: {{
     legend: {{ labels: {{ color: '#9ca3af' }} }},
-    tooltip: {{
-      callbacks: {{
-        label: (ctx) => ' $ ' + ctx.parsed.y.toLocaleString('es-CO') + ' MM'
-      }}
-    }}
+    tooltip: {{ callbacks: {{ label: (ctx) => ' $ ' + (ctx.parsed.y ?? ctx.parsed).toLocaleString('es-CO') + ' MM' }} }}
   }},
   scales: {{
     x: {{ ticks: {{ color: '#9ca3af' }}, grid: {{ color: '#1f2937' }} }},
@@ -522,44 +736,282 @@ const commonOpts = {{
          title: {{ display: true, text: 'Volumen (miles de millones COP)', color: '#9ca3af' }} }}
   }}
 }};
-
 function barChart(id, labels, data) {{
+  if (!labels.length) return;
   new Chart(document.getElementById(id), {{
     type: 'bar',
-    data: {{
-      labels,
-      datasets: [{{ data, backgroundColor: colors, borderRadius: 6, borderSkipped: false }}]
-    }},
+    data: {{ labels, datasets: [{{ data, backgroundColor: colors, borderRadius: 6, borderSkipped: false }}] }},
     options: {{ ...commonOpts, plugins: {{ ...commonOpts.plugins, legend: {{ display: false }} }} }}
   }});
 }}
-
 function doughnut(id, labels, data) {{
+  if (!labels.length) return;
   new Chart(document.getElementById(id), {{
     type: 'doughnut',
-    data: {{
-      labels,
-      datasets: [{{ data, backgroundColor: colors, borderWidth: 0 }}]
-    }},
+    data: {{ labels, datasets: [{{ data, backgroundColor: colors, borderWidth: 0 }}] }},
     options: {{
-      responsive: true,
-      maintainAspectRatio: false,
+      responsive: true, maintainAspectRatio: false,
       plugins: {{
         legend: {{ position: 'right', labels: {{ color: '#9ca3af', boxWidth: 12 }} }},
-        tooltip: {{
-          callbacks: {{
-            label: (ctx) => ' $ ' + ctx.parsed.toLocaleString('es-CO') + ' MM'
-          }}
-        }}
+        tooltip: {{ callbacks: {{ label: (ctx) => ' $ ' + ctx.parsed.toLocaleString('es-CO') + ' MM' }} }}
       }}
     }}
   }});
 }}
-
 doughnut('chartFamilia', {json.dumps(fam_l)}, {json.dumps(fam_v)});
 barChart('chartBucket', {json.dumps(buck_l)}, {json.dumps(buck_v)});
 barChart('chartPrefijo', {json.dumps(pref_l)}, {json.dumps(pref_v)});
 barChart('chartEmisor', {json.dumps(em_l)}, {json.dumps(em_v)});
+barChart('chartTasa', {json.dumps(tasa_l)}, {json.dumps(tasa_v)});
+</script>
+</body>
+</html>"""
+
+
+def _render_corporativa(df: pd.DataFrame, ops: pd.DataFrame, fecha) -> str:
+    """HTML corporativo con Plotly: plazos × volumen × nemotécnico / tipo de tasa."""
+    generated = datetime.now().strftime("%Y-%m-%d %H:%M")
+    vol_total = float(df["Volumen_num"].sum())
+    n_titulos = int(df["Nemotecnico_norm"].nunique()) if "Nemotecnico_norm" in df.columns else len(df)
+
+    # Datos para stacked bar: bucket × tipo_tasa
+    pivot = (
+        df.groupby(["Bucket_vencimiento", "Tipo_tasa"], dropna=False)["Volumen_num"]
+        .sum()
+        .reset_index()
+    )
+    order_b = ["Vencido", "< 1 año", "1–3 años", "3–5 años", "5–10 años", "> 10 años", "Sin fecha"]
+    buckets = [b for b in order_b if b in set(pivot["Bucket_vencimiento"].astype(str))]
+    tipos = sorted(pivot["Tipo_tasa"].astype(str).unique().tolist())
+    series = []
+    for t in tipos:
+        vals = []
+        sub = pivot[pivot["Tipo_tasa"].astype(str) == t]
+        for b in buckets:
+            hit = sub[sub["Bucket_vencimiento"].astype(str) == b]["Volumen_num"]
+            vals.append(round(float(hit.sum()) / 1e9, 3) if len(hit) else 0)
+        series.append({"name": t, "values": vals})
+
+    # Bubble: x=años, y=volumen, size=cantidad, color=tipo tasa, text=nemo
+    bubbles = []
+    for _, r in df.iterrows():
+        bubbles.append({
+            "x": float(r["Anios_vencimiento"]) if pd.notna(r.get("Anios_vencimiento")) else None,
+            "y": round(float(r.get("Volumen_num", 0) or 0) / 1e9, 3),
+            "size": max(8, min(60, math.sqrt(max(float(r.get("Cantidad_num", 0) or 0), 0) / 1e9) * 4)),
+            "nemo": str(r.get("Nemotecnico_norm", "")),
+            "tipo": str(r.get("Tipo_tasa", "")),
+            "emisor": str(r.get(_find_col(df, "emisor") or "Emisor", r.get("Emisor", ""))),
+        })
+    bubbles = [b for b in bubbles if b["x"] is not None]
+
+    # Top nemotécnicos por volumen (barras)
+    top_n = (
+        df.groupby("Nemotecnico_norm", as_index=False)["Volumen_num"]
+        .sum()
+        .sort_values("Volumen_num", ascending=False)
+        .head(20)
+    )
+    top_labels = top_n["Nemotecnico_norm"].tolist()
+    top_vals = [round(float(v) / 1e9, 3) for v in top_n["Volumen_num"].tolist()]
+
+    detalle_json = json.dumps(_detalle_rows_json(df), ensure_ascii=False)
+    ops_json = json.dumps(_ops_rows_json(ops), ensure_ascii=False)
+
+    return f"""<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Deuda corporativa BVC · {fecha}</title>
+<script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+<style>
+:root {{ --bg:#0b1220; --card:#111827; --border:#1f2937; --text:#e5e7eb; --muted:#9ca3af; --accent:#38bdf8; }}
+* {{ box-sizing: border-box; }}
+body {{ margin:0; font-family:Segoe UI,system-ui,sans-serif; background:var(--bg); color:var(--text); }}
+.wrap {{ max-width:1200px; margin:0 auto; padding:2rem 1.25rem 3rem; }}
+h1 {{ margin:0 0 0.25rem; font-size:1.7rem; }}
+.sub {{ color:var(--muted); margin-bottom:1.5rem; }}
+.kpis {{ display:grid; grid-template-columns:repeat(3,1fr); gap:1rem; margin-bottom:1.25rem; }}
+.kpi {{ background:var(--card); border:1px solid var(--border); border-radius:14px; padding:1rem 1.15rem; }}
+.kpi .label {{ color:var(--muted); font-size:0.78rem; text-transform:uppercase; }}
+.kpi .value {{ font-size:1.35rem; font-weight:700; color:var(--accent); margin-top:0.3rem; }}
+.card {{ background:var(--card); border:1px solid var(--border); border-radius:16px; padding:1.2rem; margin-bottom:1.25rem; }}
+.card h2 {{ margin:0 0 0.85rem; font-size:1.05rem; }}
+table {{ width:100%; border-collapse:collapse; font-size:0.84rem; }}
+th,td {{ padding:0.45rem 0.5rem; border-bottom:1px solid var(--border); text-align:left; }}
+th {{ color:var(--muted); font-size:0.72rem; text-transform:uppercase; }}
+td.num {{ text-align:right; font-variant-numeric:tabular-nums; }}
+code {{ background:#1e293b; padding:0.1rem 0.35rem; border-radius:4px; color:#7dd3fc; font-size:0.8rem; }}
+.pager {{ display:flex; gap:0.5rem; align-items:center; margin-top:0.75rem; flex-wrap:wrap; }}
+.pager button {{ background:#1e293b; border:1px solid var(--border); color:var(--text); padding:0.35rem 0.75rem; border-radius:8px; cursor:pointer; }}
+.pager button:disabled {{ opacity:0.4; }}
+.pager .info {{ color:var(--muted); font-size:0.85rem; margin-right:auto; }}
+footer {{ text-align:center; color:var(--muted); font-size:0.8rem; margin-top:1.5rem; }}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Deuda corporativa — BVC</h1>
+  <div class="sub">Sesión {fecha} · Generado {generated}</div>
+
+  <section class="kpis">
+    <div class="kpi"><div class="label">Volumen</div><div class="value">{_fmt_cop(vol_total)}</div></div>
+    <div class="kpi"><div class="label">Títulos</div><div class="value">{n_titulos}</div></div>
+    <div class="kpi"><div class="label">Filas listado</div><div class="value">{len(df)}</div></div>
+  </section>
+
+  <div class="card">
+    <h2>Volumen por plazo (eje X) y tipo de tasa (series apiladas)</h2>
+    <div id="chartStacked" style="height:380px"></div>
+  </div>
+
+  <div class="card">
+    <h2>Mapa de burbujas — plazo (X) × volumen (Y) · tamaño = cantidad · color = tipo de tasa</h2>
+    <p class="sub" style="margin-top:-0.4rem">Cada punto es un nemotécnico. Ideal para ver concentración por vencimiento y tasa.</p>
+    <div id="chartBubble" style="height:420px"></div>
+  </div>
+
+  <div class="card">
+    <h2>Top 20 nemotécnicos por volumen</h2>
+    <div id="chartTop" style="height:360px"></div>
+  </div>
+
+  <div class="card">
+    <h2>Listado completo (paginado cada 25)</h2>
+    <table>
+      <thead><tr>
+        <th>Nemotécnico</th><th>Emisor</th><th>Familia</th><th>Vencimiento</th>
+        <th>Bucket</th><th>Tipo tasa</th><th>Cantidad</th><th>Volumen</th>
+      </tr></thead>
+      <tbody id="tbodyListado"></tbody>
+    </table>
+    <div class="pager">
+      <span class="info" id="infoListado"></span>
+      <button type="button" onclick="pageListado(-1)" id="prevL">Anterior</button>
+      <button type="button" onclick="pageListado(1)" id="nextL">Siguiente</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Operaciones Contado (Hora, Rueda, Tasa, Cantidad…)</h2>
+    <table>
+      <thead><tr>
+        <th>Hora</th><th>Rueda</th><th>Nemotécnico</th><th>Precio</th>
+        <th>Tasa</th><th>Cantidad</th><th>Volumen</th><th>Procedencia</th>
+      </tr></thead>
+      <tbody id="tbodyOps"></tbody>
+    </table>
+    <div class="pager">
+      <span class="info" id="infoOps"></span>
+      <button type="button" onclick="pageOps(-1)" id="prevO">Anterior</button>
+      <button type="button" onclick="pageOps(1)" id="nextO">Siguiente</button>
+    </div>
+  </div>
+
+  <footer>Fuente: Bolsa de Valores de Colombia · bvc-renta-fija</footer>
+</div>
+
+<script>
+const PAGE = 25;
+const DETALLE = {detalle_json};
+const OPS = {ops_json};
+let pageL = 0, pageO = 0;
+
+const buckets = {json.dumps(buckets, ensure_ascii=False)};
+const series = {json.dumps(series, ensure_ascii=False)};
+const bubbles = {json.dumps(bubbles, ensure_ascii=False)};
+const topLabels = {json.dumps(top_labels, ensure_ascii=False)};
+const topVals = {json.dumps(top_vals)};
+
+const palette = ['#38bdf8','#a78bfa','#34d399','#fbbf24','#f472b6','#60a5fa','#c084fc','#2dd4bf','#fb923c','#e879f9','#94a3b8'];
+
+// Stacked bars: X = plazos, stack = tipo tasa, Y = volumen
+Plotly.newPlot('chartStacked', series.map((s, i) => ({{
+  type: 'bar', name: s.name, x: buckets, y: s.values,
+  marker: {{ color: palette[i % palette.length] }}
+}})), {{
+  barmode: 'stack',
+  paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
+  font: {{ color: '#9ca3af' }},
+  margin: {{ t: 20, r: 20, b: 60, l: 60 }},
+  yaxis: {{ title: 'Volumen (miles de millones COP)', gridcolor: '#1f2937' }},
+  xaxis: {{ title: 'Plazo / bucket de vencimiento', gridcolor: '#1f2937' }},
+  legend: {{ orientation: 'h', y: -0.25 }}
+}}, {{responsive: true, displayModeBar: false}});
+
+// Bubbles
+const byTipo = {{}};
+bubbles.forEach(b => {{
+  if (!byTipo[b.tipo]) byTipo[b.tipo] = {{ x: [], y: [], size: [], text: [], customdata: [] }};
+  byTipo[b.tipo].x.push(b.x);
+  byTipo[b.tipo].y.push(b.y);
+  byTipo[b.tipo].size.push(b.size);
+  byTipo[b.tipo].text.push(b.nemo);
+  byTipo[b.tipo].customdata.push(b.emisor);
+}});
+Plotly.newPlot('chartBubble', Object.keys(byTipo).map((t, i) => ({{
+  type: 'scatter', mode: 'markers', name: t,
+  x: byTipo[t].x, y: byTipo[t].y,
+  text: byTipo[t].text, customdata: byTipo[t].customdata,
+  marker: {{ size: byTipo[t].size, color: palette[i % palette.length], opacity: 0.75, line: {{ width: 0 }} }},
+  hovertemplate: '<b>%{{text}}</b><br>Emisor: %{{customdata}}<br>Plazo: %{{x:.1f}} años<br>Vol: %{{y}} MM<extra>' + t + '</extra>'
+}})), {{
+  paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
+  font: {{ color: '#9ca3af' }},
+  margin: {{ t: 20, r: 20, b: 50, l: 60 }},
+  xaxis: {{ title: 'Años a vencimiento (plazo)', gridcolor: '#1f2937', zeroline: false }},
+  yaxis: {{ title: 'Volumen (miles de millones COP)', gridcolor: '#1f2937', zeroline: false }},
+  legend: {{ orientation: 'h', y: -0.2 }}
+}}, {{responsive: true, displayModeBar: false}});
+
+Plotly.newPlot('chartTop', [{{
+  type: 'bar', orientation: 'h',
+  y: topLabels.slice().reverse(),
+  x: topVals.slice().reverse(),
+  marker: {{ color: '#38bdf8' }}
+}}], {{
+  paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
+  font: {{ color: '#9ca3af' }},
+  margin: {{ t: 10, r: 20, b: 40, l: 100 }},
+  xaxis: {{ title: 'Volumen (MM COP)', gridcolor: '#1f2937' }},
+  yaxis: {{ gridcolor: '#1f2937' }}
+}}, {{responsive: true, displayModeBar: false}});
+
+function renderListado() {{
+  const start = pageL * PAGE;
+  const slice = DETALLE.slice(start, start + PAGE);
+  document.getElementById('tbodyListado').innerHTML = slice.map(r => `<tr>
+    <td><code>${{r.nemotecnico}}</code></td><td>${{r.emisor}}</td><td>${{r.familia}}</td>
+    <td>${{r.vencimiento}}</td><td>${{r.bucket}}</td><td>${{r.tipo_tasa}}</td>
+    <td class="num">${{r.cantidad}}</td><td class="num">${{r.volumen}}</td>
+  </tr>`).join('') || '<tr><td colspan="8">Sin datos</td></tr>';
+  const total = DETALLE.length;
+  document.getElementById('infoListado').textContent = total
+    ? `Filas ${{start+1}}–${{Math.min(start+PAGE,total)}} de ${{total}}`
+    : 'Sin datos';
+  document.getElementById('prevL').disabled = pageL <= 0;
+  document.getElementById('nextL').disabled = start + PAGE >= total;
+}}
+function renderOps() {{
+  const start = pageO * PAGE;
+  const slice = OPS.slice(start, start + PAGE);
+  document.getElementById('tbodyOps').innerHTML = slice.map(r => `<tr>
+    <td>${{r.hora}}</td><td>${{r.rueda}}</td><td><code>${{r.nemotecnico}}</code></td>
+    <td class="num">${{r.precio}}</td><td class="num">${{r.tasa}}</td>
+    <td class="num">${{r.cantidad}}</td><td class="num">${{r.volumen}}</td>
+    <td>${{r.procedencia}}</td>
+  </tr>`).join('') || '<tr><td colspan="8">Sin operaciones Contado en este reporte</td></tr>';
+  const total = OPS.length;
+  document.getElementById('infoOps').textContent = total
+    ? `Ops ${{start+1}}–${{Math.min(start+PAGE,total)}} de ${{total}}`
+    : 'Sin operaciones Contado';
+  document.getElementById('prevO').disabled = pageO <= 0;
+  document.getElementById('nextO').disabled = start + PAGE >= total;
+}}
+function pageListado(d) {{ pageL = Math.max(0, pageL + d); renderListado(); }}
+function pageOps(d) {{ pageO = Math.max(0, pageO + d); renderOps(); }}
+renderListado(); renderOps();
 </script>
 </body>
 </html>"""
