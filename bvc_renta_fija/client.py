@@ -2,10 +2,10 @@
 Cliente Playwright para extraer datos de renta fija de la BVC.
 
 Soporta:
-- Los tres segmentos (pÃºblico, privado, corporativa)
-- Fecha Ãºnica o rango de fechas
-- BÃºsqueda por nemotÃ©cnico
-- Historial de un nemotÃ©cnico en un rango
+- Los tres segmentos (pÃƒÂºblico, privado, corporativa)
+- Fecha ÃƒÂºnica o rango de fechas
+- BÃƒÂºsqueda por nemotÃƒÂ©cnico
+- Historial de un nemotÃƒÂ©cnico en un rango
 - Cache local opcional en Parquet
 """
 from __future__ import annotations
@@ -42,8 +42,8 @@ Segmento = Literal[
 ]
 
 SEGMENTO_LABELS = {
-    "deuda_publica_segmento_publico": "Deuda pÃºblica segmento pÃºblico",
-    "deuda_publica_segmento_privado": "Deuda pÃºblica segmento privado",
+    "deuda_publica_segmento_publico": "Deuda pÃƒÂºblica segmento pÃƒÂºblico",
+    "deuda_publica_segmento_privado": "Deuda pÃƒÂºblica segmento privado",
     "deuda_corporativa": "Deuda corporativa",
 }
 
@@ -62,7 +62,7 @@ def _parse_fecha(fecha: FechaLike) -> date:
 
 
 def _daterange(inicio: date, fin: date):
-    """Genera dÃ­as hÃ¡biles aproximados (lunes-viernes)."""
+    """Genera dÃƒÂ­as hÃƒÂ¡biles aproximados (lunes-viernes)."""
     cur = inicio
     while cur <= fin:
         if cur.weekday() < 5:
@@ -125,7 +125,7 @@ class BVCRentaFija:
             self._playwright = None
 
     # ------------------------------------------------------------------
-    # API pÃºblica â€” segmentos
+    # API pÃƒÂºblica Ã¢â‚¬â€ segmentos
     # ------------------------------------------------------------------
     def get_deuda_publica_segmento_publico(self, fecha: Optional[FechaLike] = None, fecha_inicio: Optional[FechaLike] = None, fecha_fin: Optional[FechaLike] = None) -> pd.DataFrame:
         return self._get("deuda_publica_segmento_publico", fecha=fecha, fecha_inicio=fecha_inicio, fecha_fin=fecha_fin)
@@ -148,10 +148,10 @@ class BVCRentaFija:
         return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
     # ------------------------------------------------------------------
-    # API pÃºblica â€” bÃºsqueda
+    # API pÃƒÂºblica Ã¢â‚¬â€ bÃƒÂºsqueda
     # ------------------------------------------------------------------
     def buscar(self, nemotecnico: str, fecha: Optional[FechaLike] = None, fecha_inicio: Optional[FechaLike] = None, fecha_fin: Optional[FechaLike] = None, segmento: Optional[Segmento] = None) -> pd.DataFrame:
-        """Filtra por nemotÃ©cnico en uno o todos los segmentos."""
+        """Filtra por nemotÃƒÂ©cnico en uno o todos los segmentos."""
         segmentos = [segmento] if segmento else list(SEGMENTO_LABELS.keys())
         frames = []
         for seg in segmentos:
@@ -168,17 +168,17 @@ class BVCRentaFija:
         return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
     def get_historial_nemotecnico(self, nemotecnico: str, fecha_inicio: FechaLike, fecha_fin: FechaLike, segmento: Optional[Segmento] = None) -> pd.DataFrame:
-        """Recorre un rango de dÃ­as hÃ¡biles y devuelve las filas del nemotÃ©cnico."""
+        """Recorre un rango de dÃƒÂ­as hÃƒÂ¡biles y devuelve las filas del nemotÃƒÂ©cnico."""
         return self.buscar(nemotecnico=nemotecnico, fecha_inicio=fecha_inicio, fecha_fin=fecha_fin, segmento=segmento)
 
     # ------------------------------------------------------------------
-    # API pÃºblica â€” ficha facial y operaciones intradÃ­a
+    # API pÃƒÂºblica Ã¢â‚¬â€ ficha facial y operaciones intradÃƒÂ­a
     # ------------------------------------------------------------------
     def get_detalle_titulo(self, nemotecnico: str, segmento: Optional[Segmento] = "deuda_corporativa", slug_url: Optional[str] = None) -> dict:
-        """Lee los pares etiqueta/valor de la ficha visible de una emisiÃ³n BVC.
+        """Lee los pares etiqueta/valor de la ficha visible de una emisiÃƒÂ³n BVC.
 
-        Si un nemotÃ©cnico aparece en varias emisiones, pase `slug_url` con la URL
-        del vencimiento concreto para evitar seleccionar una emisiÃ³n arbitraria.
+        Si un nemotÃƒÂ©cnico aparece en varias emisiones, pase `slug_url` con la URL
+        del vencimiento concreto para evitar seleccionar una emisiÃƒÂ³n arbitraria.
         """
         self._start()
         assert self._browser is not None
@@ -206,7 +206,7 @@ class BVCRentaFija:
                         key, value = text.split(":", 1)
                         if key.strip() and value.strip():
                             pairs[key.strip()] = value.strip()
-            return {"Nemotecnico": title.upper() or symbol, "Segmento": segmento, "URL": page.url, "Fuente_datos": "BVC" if pairs else None, "Estado": "OK" if pairs else "No verificado: BVC no devolviÃ³ una ficha legible", "Detalle": pairs}
+            return {"Nemotecnico": title.upper() or symbol, "Segmento": segmento, "URL": page.url, "Fuente_datos": "BVC" if pairs else None, "Estado": "OK" if pairs else "No verificado: BVC no devolviÃƒÂ³ una ficha legible", "Detalle": pairs}
         finally:
             page.close()
 
@@ -222,7 +222,7 @@ class BVCRentaFija:
 
     @staticmethod
     def _normalizar_operaciones_api(payload: dict, nemotecnico: str, fecha: date, segmento: Optional[Segmento]) -> pd.DataFrame:
-        """Normaliza operaciones BVC de contado y simultÃ¡neas sin descartar tipos."""
+        """Normaliza operaciones BVC de contado y simultÃƒÂ¡neas sin descartar tipos."""
         cols = ["Hora", "Rueda", "Precio", "Tasa", "Cantidad", "VolÃºmenes", "Procedencia", "Tipo_operacion"]
         outcols = cols + ["Nemotecnico", "Fecha", "Segmento", "Fuente_datos"]
         data = payload.get("data") if isinstance(payload, dict) else None
@@ -246,8 +246,8 @@ class BVCRentaFija:
     def get_operaciones_titulo(self, nemotecnico: str, fecha: Optional[FechaLike] = None, segmento: Optional[Segmento] = "deuda_corporativa", slug_url: Optional[str] = None) -> pd.DataFrame:
         """Consulta la API de operaciones BVC usando el mismo handshake del sitio oficial.
 
-        La interfaz pÃºblica obtiene un token temporal en /api/handshake y envÃ­a
-        los encabezados token y k a rest.bvc.com.co. Se captura k de la peticiÃ³n
+        La interfaz pÃƒÂºblica obtiene un token temporal en /api/handshake y envÃƒÂ­a
+        los encabezados token y k a rest.bvc.com.co. Se captura k de la peticiÃƒÂ³n
         que genera el propio frontend para evitar codificar credenciales.
         """
         target = _parse_fecha(fecha) if fecha is not None else date.today()
@@ -290,7 +290,7 @@ class BVCRentaFija:
                 pass
             if not captured.get("k"):
                 raise RuntimeError(
-                    "BVC no generÃ³ la peticiÃ³n inicial de operaciones; no fue posible "
+                    "BVC no generÃƒÂ³ la peticiÃƒÂ³n inicial de operaciones; no fue posible "
                     f"capturar el encabezado k. URL={page.url!r}; tÃ­tulo={page.title()!r}"
                 )
 
@@ -324,11 +324,11 @@ class BVCRentaFija:
             page.close()
 
     def _get_identificadores_emision(self, fecha: FechaLike, segmento: Segmento) -> list[str]:
-        """Obtiene los identificadores completos de emisiÃ³n desde la respuesta JSON de BVC.
+        """Obtiene los identificadores completos de emisiÃƒÂ³n desde la respuesta JSON de BVC.
 
-        El listado HTML muestra solo el nemotÃ©cnico corto y puede mezclar varias
+        El listado HTML muestra solo el nemotÃƒÂ©cnico corto y puede mezclar varias
         emisiones del mismo instrumento. La respuesta lvl-2 contiene `mnemonic`
-        con el identificador exacto que requiere la ficha intradÃ­a.
+        con el identificador exacto que requiere la ficha intradÃƒÂ­a.
         """
         target = _parse_fecha(fecha)
         self._start()
@@ -355,8 +355,8 @@ class BVCRentaFija:
             self._seleccionar_fecha(page, target)
             page.wait_for_timeout(1800)
             if not responses:
-                raise RuntimeError(f"BVC no devolviÃ³ el listado JSON de emisiones para {target.isoformat()}")
-            # La Ãºltima respuesta corresponde al estado final tras aplicar la fecha.
+                raise RuntimeError(f"BVC no devolviÃƒÂ³ el listado JSON de emisiones para {target.isoformat()}")
+            # La ÃƒÂºltima respuesta corresponde al estado final tras aplicar la fecha.
             rows = responses[-1]
             ids = []
             seen = set()
@@ -373,12 +373,12 @@ class BVCRentaFija:
             page.close()
 
     def get_operaciones_dia(self, fecha: Optional[FechaLike] = None, segmento: Optional[Segmento] = "deuda_corporativa", max_titulos: Optional[int] = None) -> pd.DataFrame:
-        """Consolida las operaciones de todas las emisiones del dÃ­a y las ordena por hora.
+        """Consolida las operaciones de todas las emisiones del dÃƒÂ­a y las ordena por hora.
 
-        Para deuda corporativa consulta los identificadores completos de emisiÃ³n
+        Para deuda corporativa consulta los identificadores completos de emisiÃƒÂ³n
         que entrega la API de BVC, evitando perder operaciones cuando un ticker
-        corto agrupa varias emisiones. `max_titulos` limita opcionalmente el nÃºmero
-        de emisiones, Ãºtil para pruebas rÃ¡pidas.
+        corto agrupa varias emisiones. `max_titulos` limita opcionalmente el nÃƒÂºmero
+        de emisiones, ÃƒÂºtil para pruebas rÃƒÂ¡pidas.
         """
         outcols = ["Hora", "Rueda", "Precio", "Tasa", "Cantidad", "VolÃºmenes", "Procedencia", "Tipo_operacion", "Nemotecnico", "Fecha", "Segmento", "Fuente_datos"]
         seg = segmento or "deuda_corporativa"
@@ -405,10 +405,10 @@ class BVCRentaFija:
                 if not df.empty:
                     frames.append(df)
             except Exception as exc:
-                logger.warning("No se pudo extraer operaciones de emisiÃ³n %s (fecha=%s): %s", identifier, target, exc)
+                logger.warning("No se pudo extraer operaciones de emisiÃƒÂ³n %s (fecha=%s): %s", identifier, target, exc)
         if not frames:
             return pd.DataFrame(columns=outcols)
-        result = pd.concat(frames, ignore_index=True)  # BVC no entrega ID de operaciÃ³n: no descartar filas idÃ©nticas
+        result = pd.concat(frames, ignore_index=True)  # BVC no entrega ID de operaciÃƒÂ³n: no descartar filas idÃƒÂ©nticas
         if "Hora" in result.columns:
             result = result.sort_values("Hora", kind="stable", na_position="last")
         return result.reindex(columns=outcols).reset_index(drop=True)
@@ -444,14 +444,14 @@ class BVCRentaFija:
         return self.cache_dir / f"{segmento}_{key}.parquet"
 
     def _save_cache(self, path: Path, df: pd.DataFrame) -> None:
-        """Escritura atÃ³mica de parquet (tmp + rename) para evitar archivos de 0 bytes."""
+        """Escritura atÃƒÂ³mica de parquet (tmp + rename) para evitar archivos de 0 bytes."""
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             tmp = path.with_suffix(path.suffix + ".tmp")
             df.to_parquet(tmp, index=False)
             if tmp.stat().st_size == 0:
                 tmp.unlink(missing_ok=True)
-                logger.warning("Cache vacÃ­o no guardado: %s", path.name)
+                logger.warning("Cache vacÃƒÂ­o no guardado: %s", path.name)
                 return
             tmp.replace(path)
             logger.info("Cache saved: %s (%d bytes)", path.name, path.stat().st_size)
@@ -465,7 +465,7 @@ class BVCRentaFija:
                 logger.info("Cache hit: %s", path.name)
                 return pd.read_parquet(path)
             except Exception as exc:
-                logger.warning("Cache invÃ¡lido %s: %s", path.name, exc)
+                logger.warning("Cache invÃƒÂ¡lido %s: %s", path.name, exc)
         self._start()
         assert self._browser is not None
         page = self._context.new_page()
@@ -478,7 +478,7 @@ class BVCRentaFija:
                 page.get_by_text(label, exact=False).first.click(timeout=8000)
                 page.wait_for_timeout(1500)
             except PlaywrightTimeout:
-                logger.warning("No se encontrÃ³ la pestaÃ±a %s; se usa la vista actual", label)
+                logger.warning("No se encontrÃƒÂ³ la pestaÃƒÂ±a %s; se usa la vista actual", label)
             if fecha is not None:
                 self._seleccionar_fecha(page, fecha)
             page.wait_for_selector("table", timeout=12_000)
@@ -511,9 +511,9 @@ class BVCRentaFija:
     def _seleccionar_fecha(self, page: Page, target: date) -> None:
         """Selecciona y verifica una fecha en el date-picker de BVC.
 
-        BVC renderiza campos visibles separados para aÃ±o, mes y dÃ­a y un input
+        BVC renderiza campos visibles separados para aÃƒÂ±o, mes y dÃƒÂ­a y un input
         ISO oculto. Espera a que React hidrate el selector y solo usa el calendario
-        como alternativa si los campos separados no estÃ¡n disponibles.
+        como alternativa si los campos separados no estÃƒÂ¡n disponibles.
         """
         meses = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
         date_selector = 'input[name="date"][type="date"]'
@@ -521,7 +521,7 @@ class BVCRentaFija:
         month_selector = 'input[name="month"]'
         day_selector = 'input[name="day"]'
 
-        # La pÃ¡gina puede devolver DOMContentLoaded antes de que React monte el picker.
+        # La pÃƒÂ¡gina puede devolver DOMContentLoaded antes de que React monte el picker.
         try:
             page.wait_for_function(
                 """() => document.querySelector('input[name="year"]') ||
@@ -554,7 +554,7 @@ class BVCRentaFija:
                 return
             actual_value = date_input.input_value() if date_input.count() else None
             raise BVCDateSelectionError(
-                f"BVC no confirmÃ³ la fecha {target.isoformat()} tras editar aÃ±o/mes/dÃ­a; "
+                f"BVC no confirmÃƒÂ³ la fecha {target.isoformat()} tras editar aÃƒÂ±o/mes/dÃƒÂ­a; "
                 f"valor actual={actual_value!r}; URL={page.url!r}"
             )
 
@@ -574,7 +574,7 @@ class BVCRentaFija:
             title = page.title()
             excerpt = re.sub(r"\s+", " ", page.locator("body").inner_text() if page.locator("body").count() else "")[:300]
             raise BVCDateSelectionError(
-                f"No se encontrÃ³ el botÃ³n del calendario de BVC para {target.isoformat()}. "
+                f"No se encontrÃƒÂ³ el botÃƒÂ³n del calendario de BVC para {target.isoformat()}. "
                 f"URL={page.url!r}; tÃ­tulo={title!r}; contenido={excerpt!r}"
             )
 
@@ -583,14 +583,14 @@ class BVCRentaFija:
         nav_label = page.locator("button.react-calendar__navigation__label").first
         if not nav_label.count():
             raise BVCDateSelectionError(
-                f"BVC abriÃ³ el date-picker pero no mostrÃ³ el selector del mes. URL={page.url!r}"
+                f"BVC abriÃƒÂ³ el date-picker pero no mostrÃƒÂ³ el selector del mes. URL={page.url!r}"
             )
         for _ in range(180):
             label = nav_label.inner_text().strip().lower()
             month_found = next((i + 1 for i, name in enumerate(meses) if name in label), None)
             year_match = re.search(r"\b(20\d{2})\b", label)
             if month_found is None or year_match is None:
-                raise BVCDateSelectionError(f"No se pudo interpretar el mes/aÃ±o del calendario: {label!r}")
+                raise BVCDateSelectionError(f"No se pudo interpretar el mes/aÃƒÂ±o del calendario: {label!r}")
             current_year = int(year_match.group(1))
             current_month = month_found
             if (current_year, current_month) == (target.year, target.month):
@@ -607,10 +607,10 @@ class BVCRentaFija:
                 next_month.click()
             page.wait_for_timeout(100)
         else:
-            raise BVCDateSelectionError(f"No se alcanzÃ³ el mes de la fecha solicitada {target.isoformat()}")
+            raise BVCDateSelectionError(f"No se alcanzÃƒÂ³ el mes de la fecha solicitada {target.isoformat()}")
         aria = f"{target.day} de {meses[target.month - 1]} de {target.year}"
         tile = page.locator(f'button.react-calendar__tile:has(abbr[aria-label="{aria}"])').first
         if not tile.count() or tile.is_disabled():
-            raise BVCDateSelectionError(f"La BVC no ofrece un dÃ­a seleccionable para {target.isoformat()}")
+            raise BVCDateSelectionError(f"La BVC no ofrece un dÃƒÂ­a seleccionable para {target.isoformat()}")
         tile.click()
- ¢ëiºÛkºwµç_ºYhºÚn¶Æ¯yÛhşiíıø¥zÏÜ¢jh²*?¢ëiºßÛjÈoz¶ìµÚ.¶ÜmFéÜjßæßßŠW¬ıÊ&¦‹"£ú.¶›­ı¶¬†÷«nË]¢ëmÆÛh¾'°¶ŸºYhºÚn¶Šî±è^iÙõÓOæßßŠW¬ıÊ&¦‹"£ú.¶›­ı¶¬†÷«nË]¢ëmÆßíj)g×M?š{~)^³÷(šš,ŠèºÚn·öÚ²Ş­»-v‹­·m¢øÂ–«¶ÊŠ
+        page.wait_for_timeout(300)
