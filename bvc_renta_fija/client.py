@@ -222,34 +222,25 @@ class BVCRentaFija:
 
     @staticmethod
     def _normalizar_operaciones_api(payload: dict, nemotecnico: str, fecha: date, segmento: Optional[Segmento]) -> pd.DataFrame:
-        """Convierte la respuesta oficial de operaciones BVC al esquema pÃºblico."""
-        cols = ["Hora", "Rueda", "Precio", "Tasa", "Cantidad", "VolÃºmenes", "Procedencia"]
+        """Normaliza operaciones BVC de contado y simultÃ¡neas sin descartar tipos."""
+        cols = ["Hora", "Rueda", "Precio", "Tasa", "Cantidad", "VolÃºmenes", "Procedencia", "Tipo_operacion"]
         outcols = cols + ["Nemotecnico", "Fecha", "Segmento", "Fuente_datos"]
         data = payload.get("data") if isinstance(payload, dict) else None
         tab = data.get("tab", {}) if isinstance(data, dict) else {}
-        rows = tab.get("contado", []) if isinstance(tab, dict) else []
-        if not isinstance(rows, list):
-            rows = []
         normalized = []
-        for item in rows:
-            if not isinstance(item, dict):
+        if not isinstance(tab, dict):
+            tab = {}
+        for operation_type in ("contado", "simultaneo"):
+            rows = tab.get(operation_type, [])
+            if not isinstance(rows, list):
                 continue
-            origin = item.get("origin")
-            if isinstance(origin, dict):
-                origin = origin.get("es") or origin.get("en")
-            normalized.append({
-                "Hora": item.get("time"),
-                "Rueda": item.get("board"),
-                "Precio": item.get("price"),
-                "Tasa": item.get("rate"),
-                "Cantidad": item.get("quantity"),
-                "VolÃºmenes": item.get("volume"),
-                "Procedencia": origin,
-                "Nemotecnico": str(nemotecnico).strip().upper(),
-                "Fecha": fecha.isoformat(),
-                "Segmento": segmento,
-                "Fuente_datos": "BVC",
-            })
+            for item in rows:
+                if not isinstance(item, dict):
+                    continue
+                origin = item.get("origin")
+                if isinstance(origin, dict):
+                    origin = origin.get("es") or origin.get("en")
+                normalized.append({"Hora": item.get("time"), "Rueda": item.get("board"), "Precio": item.get("price"), "Tasa": item.get("rate"), "Cantidad": item.get("quantity"), "VolÃºmenes": item.get("volume"), "Procedencia": origin, "Tipo_operacion": operation_type.capitalize(), "Nemotecnico": str(nemotecnico).strip().upper(), "Fecha": fecha.isoformat(), "Segmento": segmento, "Fuente_datos": "BVC"})
         return pd.DataFrame(normalized, columns=outcols)
 
     def get_operaciones_titulo(self, nemotecnico: str, fecha: Optional[FechaLike] = None, segmento: Optional[Segmento] = "deuda_corporativa", slug_url: Optional[str] = None) -> pd.DataFrame:
@@ -261,7 +252,7 @@ class BVCRentaFija:
         """
         target = _parse_fecha(fecha) if fecha is not None else date.today()
         symbol = str(nemotecnico).strip().upper()
-        outcols = ["Hora", "Rueda", "Precio", "Tasa", "Cantidad", "VolÃºmenes", "Procedencia",
+        outcols = ["Hora", "Rueda", "Precio", "Tasa", "Cantidad", "VolÃºmenes", "Procedencia", "Tipo_operacion",
                    "Nemotecnico", "Fecha", "Segmento", "Fuente_datos"]
         if segmento == "deuda_publica_segmento_publico":
             filter_key, segment_filter = "marketDataRfPub", "&filters[marketDataRfPub][segment]=A2A"
@@ -332,23 +323,95 @@ class BVCRentaFija:
         finally:
             page.close()
 
-    def get_operaciones_dia(self, fecha: Optional[FechaLike] = None, segmento: Optional[Segmento] = "deuda_corporativa", max_titulos: int = 20) -> pd.DataFrame:
-        """Consolida Contado para los primeros tÃ­tulos Ãºnicos del listado BVC."""
-        listing = self._get(segmento or "deuda_corporativa", fecha=fecha)
-        col = self._col_nemotecnico(listing)
-        outcols = ["Hora", "Rueda", "Precio", "Tasa", "Cantidad", "VolÃºmenes", "Procedencia", "Nemotecnico", "Fecha", "Segmento", "Fuente_datos"]
-        if listing.empty or col is None:
-            return pd.DataFrame(columns=outcols)
-        tickers = listing[col].dropna().astype(str).str.strip().str.upper().drop_duplicates().head(max(1, int(max_titulos)))
-        frames = []
-        for ticker in tickers:
+    def _get_identificadores_emision(self, fecha: FechaLike, segmento: Segmento) -> list[str]:
+        """Obtiene los identificadores completos de emisiÃ³n desde la respuesta JSON de BVC.
+
+        El listado HTML muestra solo el nemotÃ©cnico corto y puede mezclar varias
+        emisiones del mismo instrumento. La respuesta lvl-2 contiene `mnemonic`
+        con el identificador exacto que requiere la ficha intradÃ­a.
+        """
+        target = _parse_fecha(fecha)
+        self._start()
+        assert self._browser is not None
+        page = self._context.new_page()
+        responses: list[list[dict]] = []
+
+        def capture(response):
+            if "market-information/rf/lvl-2?" not in response.url or target.isoformat() not in response.url:
+                return
             try:
-                df = self.get_operaciones_titulo(ticker, fecha=fecha, segmento=segmento)
+                payload = response.json()
+                rows = payload.get("data", {}).get("tab", [])
+                if isinstance(rows, list) and rows and isinstance(rows[0], dict) and "mnemonic" in rows[0]:
+                    responses.append(rows)
+            except Exception:
+                return
+
+        page.on("response", capture)
+        try:
+            page.set_default_timeout(self.timeout)
+            page.goto("https://www.bvc.com.co/mercado-local-en-linea?tab=renta-fija_deuda-corporativa", wait_until="domcontentloaded")
+            page.wait_for_timeout(1800)
+            self._seleccionar_fecha(page, target)
+            page.wait_for_timeout(1800)
+            if not responses:
+                raise RuntimeError(f"BVC no devolviÃ³ el listado JSON de emisiones para {target.isoformat()}")
+            # La Ãºltima respuesta corresponde al estado final tras aplicar la fecha.
+            rows = responses[-1]
+            ids = []
+            seen = set()
+            for row in rows:
+                value = row.get("mnemonic")
+                if not isinstance(value, str) or not value.strip():
+                    continue
+                value = value.strip()
+                if value.upper() not in seen:
+                    ids.append(value)
+                    seen.add(value.upper())
+            return ids
+        finally:
+            page.close()
+
+    def get_operaciones_dia(self, fecha: Optional[FechaLike] = None, segmento: Optional[Segmento] = "deuda_corporativa", max_titulos: Optional[int] = None) -> pd.DataFrame:
+        """Consolida las operaciones de todas las emisiones del dÃ­a y las ordena por hora.
+
+        Para deuda corporativa consulta los identificadores completos de emisiÃ³n
+        que entrega la API de BVC, evitando perder operaciones cuando un ticker
+        corto agrupa varias emisiones. `max_titulos` limita opcionalmente el nÃºmero
+        de emisiones, Ãºtil para pruebas rÃ¡pidas.
+        """
+        outcols = ["Hora", "Rueda", "Precio", "Tasa", "Cantidad", "VolÃºmenes", "Procedencia", "Tipo_operacion", "Nemotecnico", "Fecha", "Segmento", "Fuente_datos"]
+        seg = segmento or "deuda_corporativa"
+        if fecha is None:
+            target = date.today()
+        else:
+            target = _parse_fecha(fecha)
+        if seg == "deuda_corporativa":
+            identifiers = self._get_identificadores_emision(target, seg)
+        else:
+            listing = self._get(seg, fecha=target)
+            col = self._col_nemotecnico(listing)
+            if listing.empty or col is None:
+                return pd.DataFrame(columns=outcols)
+            identifiers = listing[col].dropna().astype(str).str.strip().str.upper().drop_duplicates().tolist()
+        if max_titulos is not None:
+            identifiers = identifiers[:max(1, int(max_titulos))]
+        frames = []
+        root = "https://www.bvc.com.co/renta-fija-deuda-corporativa"
+        for identifier in identifiers:
+            try:
+                slug_url = f"{root}/{identifier.lower()}?tab=operaciones" if seg == "deuda_corporativa" else None
+                df = self.get_operaciones_titulo(identifier, fecha=target, segmento=seg, slug_url=slug_url)
                 if not df.empty:
                     frames.append(df)
             except Exception as exc:
-                logger.warning("No se pudo extraer Contado de %s: %s", ticker, exc)
-        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=outcols)
+                logger.warning("No se pudo extraer operaciones de emisiÃ³n %s (fecha=%s): %s", identifier, target, exc)
+        if not frames:
+            return pd.DataFrame(columns=outcols)
+        result = pd.concat(frames, ignore_index=True)  # BVC no entrega ID de operaciÃ³n: no descartar filas idÃ©nticas
+        if "Hora" in result.columns:
+            result = result.sort_values("Hora", kind="stable", na_position="last")
+        return result.reindex(columns=outcols).reset_index(drop=True)
 
     # ------------------------------------------------------------------
     # Internos
@@ -550,35 +613,4 @@ class BVCRentaFija:
         if not tile.count() or tile.is_disabled():
             raise BVCDateSelectionError(f"La BVC no ofrece un dÃ­a seleccionable para {target.isoformat()}")
         tile.click()
-        page.wait_for_timeout(500)
-        actual = page.locator(date_selector).first
-        if not actual.count():
-            raise BVCDateSelectionError("No se pudo validar la fecha seleccionada: falta input[name=date]")
-        selected = actual.input_value()
-        if selected != target.isoformat():
-            raise BVCDateSelectionError(
-                f"BVC no confirmÃ³ la fecha {target.isoformat()}; la interfaz quedÃ³ en {selected!r}"
-            )
-
-    @staticmethod
-    def _col_nemotecnico(df: pd.DataFrame) -> Optional[str]:
-        for c in df.columns:
-            if "nemot" in str(c).lower():
-                return c
-        return None
-
-    @staticmethod
-    def _limpiar(df: pd.DataFrame) -> pd.DataFrame:
-        df = df.copy()
-        df.columns = [str(c).strip() for c in df.columns]
-        df = df.dropna(how="all").reset_index(drop=True)
-        for col in df.columns:
-            if df[col].dtype == object:
-                sample = df[col].dropna().astype(str).head(8)
-                if sample.str.contains(r"\\d[\\.,]\\d").any():
-                    cleaned = df[col].astype(str).str.replace(",", "", regex=False).str.replace("%", "", regex=False).str.strip()
-                    numeric = pd.to_numeric(cleaned, errors="coerce")
-                    if numeric.notna().sum() > len(df) * 0.5:
-                        df[col] = numeric
-        return df
-
+ ¢ëiºÛkºwµç_ºYhºÚn¶Æ¯yÛhþiíýø¥zÏÜ¢jh²*?¢ëiºßÛjÈoz¶ìµÚ.¶ÜmFéÜjßæžßßŠW¬ýÊ&¦‹"£ú.¶›­ý¶¬†÷«nË]¢ëmÆÛh¾'°¶ŸºYhºÚn¶Šî±è^iÙõÓOæžßßŠW¬ýÊ&¦‹"£ú.¶›­ý¶¬†÷«nË]¢ëmÆßíj)g×M?š{~)^³÷(šš,ŠèºÚn·öÚ²Þ­»-v‹­·m¢øžÂ–«¶ÊŠ

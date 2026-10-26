@@ -128,6 +128,16 @@ def test_official_operations_api_empty_tab_returns_empty_schema():
     )
     assert df.empty
     assert list(df.columns) == [
-        "Hora", "Rueda", "Precio", "Tasa", "Cantidad", "Volúmenes", "Procedencia",
+        "Hora", "Rueda", "Precio", "Tasa", "Cantidad", "Volúmenes", "Procedencia", "Tipo_operacion",
         "Nemotecnico", "Fecha", "Segmento", "Fuente_datos"
     ]
+
+
+def test_official_operations_api_maps_contado_and_simultaneo():
+    payload = {"data": {"tab": {
+        "contado": [{"time": "10:26", "board": "TRD", "price": 100, "rate": 13.05, "quantity": 35, "volume": 35, "origin": {"es": "Registro"}}],
+        "simultaneo": [{"time": "10:27", "board": "SIM", "price": 100, "rate": 13.05, "quantity": 20, "volume": 20, "origin": {"es": "Registro"}}],
+    }}}
+    df = BVCRentaFija._normalizar_operaciones_api(payload, "CDTFALS0V-TEST", date(2026, 10, 9), "deuda_corporativa")
+    assert list(df["Tipo_operacion"]) == ["Contado", "Simultaneo"]
+    assert list(df["Hora"]) == ["10:26", "10:27"]
