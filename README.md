@@ -79,3 +79,9 @@ with BVCRentaFija(headless=True) as client:
 `get_operaciones_dia(fecha=..., max_titulos=20)` ofrece una consolidación acotada por los primeros títulos únicos del listado. Para evitar carga innecesaria sobre la BVC, ajuste `max_titulos`; para una extracción exhaustiva, primero hay que confirmar límites de uso y disponibilidad de los datos de cada modalidad.
 
 **Importante sobre la validación:** se comprobó en una sesión del sitio oficial que el endpoint devuelve tres operaciones para `TFIT16300632` el 22 de octubre de 2026 (10:46, 10:50 y 11:42). Los valores de mercado se leen en tiempo de ejecución desde la respuesta de BVC; el caso se usa en pruebas de integración, no como dato hardcodeado de producción. Algunos entornos automatizados pueden recibir un 403 de CloudFront al abrir el sitio, lo que es una restricción de acceso del entorno y no una respuesta de mercado vacía.
+
+## Reporte corporativo: índice y operaciones
+
+El reporte corporativo incluye una gráfica de volumen por Índice (por ejemplo FS, IPC e IB1), una columna Índice en el listado y un filtro construido a partir de los tipos de operación que devuelve la API oficial. La sección de operaciones deja visible el estado de extracción y el número de filas recuperadas; si falla la consulta, muestra el error en lugar de presentar el fallo silenciosamente como si no hubiera movimientos.
+
+El selector del listado de BVC (por ejemplo Contado secundario) no es lo mismo que las categorías de operaciones de una emisión. La tabla de operaciones filtra por las categorías reales retornadas por el detalle BVC, como Contado, Repo o TTV.

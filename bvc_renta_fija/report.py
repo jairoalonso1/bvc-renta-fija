@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import math
+import html as html_lib
 from datetime import date, datetime
 from pathlib import Path
 from typing import Optional, Union
@@ -33,6 +34,19 @@ def _find_col(df: pd.DataFrame, *keywords: str) -> Optional[str]:
         if any(k in cl for k in keywords):
             return c
     return None
+
+
+def _normalizar_indice(value) -> str:
+    """Normaliza índices BVC y agrupa guiones y ausencias."""
+    try:
+        if pd.isna(value):
+            return "Sin índice"
+    except (TypeError, ValueError):
+        pass
+    text = str(value).strip()
+    if text.upper() in {"", "-", "NAN", "NONE", "NULL", "N/A", "NA"}:
+        return "Sin índice"
+    return text.upper()
 
 
 def enriquecer(df: pd.DataFrame, fecha_ref: Optional[date] = None) -> pd.DataFrame:
@@ -151,6 +165,7 @@ def enriquecer(df: pd.DataFrame, fecha_ref: Optional[date] = None) -> pd.DataFra
     col_tasa = _find_col(out, "tasa")
     col_idx = _find_col(out, "indice")
     col_per = _find_col(out, "period")
+    out["Indice_norm"] = out[col_idx].apply(_normalizar_indice) if col_idx else "Sin índice"
 
     def _tipo_tasa(row) -> str:
         tasa = str(row.get(col_tasa, "") or "").strip() if col_tasa else ""
@@ -272,6 +287,7 @@ def _detalle_rows_json(df: pd.DataFrame) -> list:
             "vencimiento": str(r.get(col_v, "") or ""),
             "bucket": str(r.get("Bucket_vencimiento", "") or ""),
             "tipo_tasa": str(r.get("Tipo_tasa", "") or ""),
+            "indice": _normalizar_indice(r.get("Indice_norm", "")),
             "tasa": str(r.get(col_tasa, "") or "") if col_tasa else "",
             "cantidad": _fmt_cop(r.get("Cantidad_num", 0)),
             "volumen": _fmt_cop(r.get("Volumen_num", 0)),
@@ -289,6 +305,7 @@ def _ops_rows_json(ops: pd.DataFrame) -> list:
             "hora": str(r.get("Hora", "") or ""),
             "rueda": str(r.get("Rueda", "") or ""),
             "nemotecnico": str(r.get("Nemotecnico", "") or ""),
+            "tipo_operacion": str(r.get("Tipo_operacion", "Contado") or "Contado"),
             "precio": str(r.get("Precio", "") or ""),
             "tasa": str(r.get("Tasa", "") or ""),
             "cantidad": str(r.get("Cantidad", "") or ""),
@@ -412,20 +429,14 @@ def generar_reporte_corporativa(
     include_operaciones: bool = True,
     max_titulos_ops: int = 12,
 ) -> Path:
-    """
-    Informe enfocado en deuda corporativa con visualización avanzada:
-
-    - Eje de plazos (buckets / años a vencimiento)
-    - Volumen por nemotécnico
-    - Desglose por tipo de tasa (listado + ficha cuando esté disponible)
-    - Tabla completa paginada
-    - Opcional: operaciones Contado (Hora, Rueda, Tasa, Cantidad)
-    """
+    """Genera el informe corporativo con análisis por índice y diagnóstico de operaciones."""
     output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     fecha = fecha or date.today().isoformat()
 
     fichas = []
     ops = pd.DataFrame()
+    ops_status = "No se solicitaron operaciones."
     with BVCRentaFija(headless=headless, cache_dir=cache_dir) as client:
         df = client.get_deuda_corporativa(fecha=fecha)
         df = enriquecer(df, fecha_ref=_parse_fecha(fecha))
@@ -449,18 +460,56 @@ def generar_reporte_corporativa(
                         or detalle.get("Periodicidad")
                         or ""
                     )
-                    fichas.append({"Nemotecnico": n, "Tipo_tasa_ficha": str(tipo)[:60], **{f"f_{k}": v for k, v in list(detalle.items())[:12]}})
+                    fichas.append({
+                        "Nemotecnico": n,
+                        "Tipo_tasa_ficha": str(tipo)[:60],
+                        **{f"f_{k}": v for k, v in list(detalle.items())[:12]},
+                    })
                 except Exception:
+                    # La ficha es enriquecimiento opcional y no debe tumbar el reporte.
                     continue
 
-        if include_operaciones and not df.empty:
+        if not include_operaciones:
+            ops_status = "Consulta de operaciones desactivada (include_operaciones=False)."
+        elif df.empty:
+            ops_status = "No se consultaron operaciones porque el listado corporativo está vacío."
+        else:
             try:
                 ops = client.get_operaciones_dia(
                     fecha=fecha,
                     segmento="deuda_corporativa",
                     max_titulos=max_titulos_ops,
                 )
-            except Exception:
+                diagnostics = getattr(client, "last_operations_diagnostics", {}) or {}
+                failures = diagnostics.get("consultas_fallidas", [])
+                attempted = diagnostics.get("emisiones_consultadas", 0)
+                if not ops.empty:
+                    ops_status = (
+                        f"Extracción completada: {len(ops)} filas; "
+                        f"{diagnostics.get('emisiones_con_datos', 0)} emisiones con datos "
+                        f"de {attempted} consultadas."
+                    )
+                    if failures:
+                        ops_status += f" Extracción parcial: {len(failures)} consultas fallaron."
+                elif diagnostics.get("estado") == "sin_emisiones":
+                    ops_status = (
+                        "La BVC no devolvió identificadores de emisiones para consultar "
+                        f"operaciones en la fecha {fecha}."
+                    )
+                else:
+                    ops_status = (
+                        f"La consulta terminó sin filas de operaciones para {fecha}; "
+                        f"emisiones consultadas: {attempted}. Revise el diagnóstico si esperaba movimientos."
+                    )
+            except Exception as exc:
+                diagnostics = getattr(client, "last_operations_diagnostics", {}) or {}
+                ops_status = "ERROR al extraer operaciones de BVC: " + str(exc)
+                if diagnostics:
+                    ops_status += (
+                        f" Estado={diagnostics.get('estado', 'desconocido')}; "
+                        f"emisiones={diagnostics.get('emisiones_encontradas', 0)}; "
+                        f"consultas fallidas={len(diagnostics.get('consultas_fallidas', []))}."
+                    )
                 ops = pd.DataFrame()
 
     if df.empty:
@@ -470,11 +519,16 @@ def generar_reporte_corporativa(
 
     if fichas:
         fdf = pd.DataFrame(fichas)
-        df = df.merge(fdf[["Nemotecnico", "Tipo_tasa_ficha"]], left_on="Nemotecnico_norm", right_on="Nemotecnico", how="left")
+        df = df.merge(
+            fdf[["Nemotecnico", "Tipo_tasa_ficha"]],
+            left_on="Nemotecnico_norm",
+            right_on="Nemotecnico",
+            how="left",
+        )
         df["Tipo_tasa"] = df["Tipo_tasa_ficha"].fillna(df.get("Tipo_tasa", "No clasificado"))
         df["Tipo_tasa"] = df["Tipo_tasa"].replace("", "No clasificado")
 
-    html = _render_corporativa(df, ops, fecha)
+    html = _render_corporativa(df, ops, fecha, ops_status=ops_status)
     output_path.write_text(html, encoding="utf-8")
     return output_path
 
@@ -675,48 +729,53 @@ function showTab(which) {{
   document.getElementById('tabOps').classList.toggle('active', which === 'ops');
 }}
 
+const filtroTipoOps = document.getElementById('filtroTipoOps');
+[...new Set(OPS.map(r => r.tipo_operacion).filter(Boolean))]
+  .sort((a, b) => a.localeCompare(b, 'es'))
+  .forEach(tipo => {{
+    const option = document.createElement('option');
+    option.value = tipo;
+    option.textContent = tipo;
+    filtroTipoOps.appendChild(option);
+  }});
+filtroTipoOps.addEventListener('change', () => {{ pageO = 0; renderOps(); }});
+
 function renderListado() {{
   const start = pageL * PAGE;
   const slice = DETALLE.slice(start, start + PAGE);
-  const tb = document.getElementById('tbodyListado');
-  tb.innerHTML = slice.map(r => `<tr>
-    <td><code>${{r.nemotecnico}}</code></td>
-    <td>${{r.emisor}}</td>
-    <td>${{r.familia}}</td>
-    <td>${{r.vencimiento}}</td>
-    <td>${{r.bucket}}</td>
-    <td>${{r.tipo_tasa}}</td>
-    <td class="num">${{r.tasa}}</td>
-    <td class="num">${{r.cantidad}}</td>
-    <td class="num">${{r.volumen}}</td>
-  </tr>`).join('') || '<tr><td colspan="9">Sin filas</td></tr>';
+  document.getElementById('tbodyListado').innerHTML = slice.map(r =>
+    '<tr><td><code>' + r.nemotecnico + '</code></td><td>' + r.emisor + '</td><td>' + r.familia +
+    '</td><td>' + r.vencimiento + '</td><td>' + r.bucket + '</td><td>' + r.indice + '</td><td>' +
+    r.tipo_tasa + '</td><td class="num">' + r.cantidad + '</td><td class="num">' + r.volumen +
+    '</td></tr>'
+  ).join('') || '<tr><td colspan="9">Sin datos</td></tr>';
   const total = DETALLE.length;
-  const pages = Math.max(1, Math.ceil(total / PAGE));
-  document.getElementById('infoListado').textContent =
-    total ? `Filas ${{start + 1}}–${{Math.min(start + PAGE, total)}} de ${{total}} · Página ${{pageL + 1}}/${{pages}}` : 'Sin datos';
-  document.getElementById('prevListado').disabled = pageL <= 0;
-  document.getElementById('nextListado').disabled = start + PAGE >= total;
+  document.getElementById('infoListado').textContent = total
+    ? 'Filas ' + (start + 1) + '–' + Math.min(start + PAGE, total) + ' de ' + total
+    : 'Sin datos';
+  document.getElementById('prevL').disabled = pageL <= 0;
+  document.getElementById('nextL').disabled = start + PAGE >= total;
 }}
-
 function renderOps() {{
+  const filtro = filtroTipoOps.value;
+  const filtradas = filtro ? OPS.filter(r => r.tipo_operacion === filtro) : OPS;
+  const pages = Math.max(1, Math.ceil(filtradas.length / PAGE));
+  pageO = Math.min(pageO, pages - 1);
   const start = pageO * PAGE;
-  const slice = OPS.slice(start, start + PAGE);
-  const tb = document.getElementById('tbodyOps');
-  tb.innerHTML = slice.map(r => `<tr>
-    <td>${{r.hora}}</td><td>${{r.rueda}}</td>
-    <td><code>${{r.nemotecnico}}</code></td>
-    <td class="num">${{r.precio}}</td><td class="num">${{r.tasa}}</td>
-    <td class="num">${{r.cantidad}}</td><td class="num">${{r.volumen}}</td>
-    <td>${{r.procedencia}}</td>
-  </tr>`).join('') || '<tr><td colspan="8">Sin operaciones Contado (genera con include_operaciones=True)</td></tr>';
-  const total = OPS.length;
-  const pages = Math.max(1, Math.ceil(total / PAGE) || 1);
-  document.getElementById('infoOps').textContent =
-    total ? `Ops ${{start + 1}}–${{Math.min(start + PAGE, total)}} de ${{total}} · Página ${{pageO + 1}}/${{pages}}` : 'Sin operaciones Contado en este reporte';
-  document.getElementById('prevOps').disabled = pageO <= 0;
-  document.getElementById('nextOps').disabled = start + PAGE >= total;
+  const slice = filtradas.slice(start, start + PAGE);
+  document.getElementById('tbodyOps').innerHTML = slice.map(r =>
+    '<tr><td>' + r.hora + '</td><td>' + r.tipo_operacion + '</td><td>' + r.rueda +
+    '</td><td><code>' + r.nemotecnico + '</code></td><td class="num">' + r.precio +
+    '</td><td class="num">' + r.tasa + '</td><td class="num">' + r.cantidad +
+    '</td><td class="num">' + r.volumen + '</td><td>' + r.procedencia + '</td></tr>'
+  ).join('') || '<tr><td colspan="9">No hay operaciones para este filtro en el reporte</td></tr>';
+  const total = filtradas.length;
+  document.getElementById('infoOps').textContent = total
+    ? 'Ops ' + (start + 1) + '–' + Math.min(start + PAGE, total) + ' de ' + total + (filtro ? ' · ' + filtro : '')
+    : (OPS.length ? 'No hay operaciones para este tipo' : 'BVC no devolvió operaciones');
+  document.getElementById('prevO').disabled = pageO <= 0;
+  document.getElementById('nextO').disabled = start + PAGE >= total;
 }}
-
 function pageListado(d) {{ pageL = Math.max(0, pageL + d); renderListado(); }}
 function pageOps(d) {{ pageO = Math.max(0, pageO + d); renderOps(); }}
 
@@ -768,9 +827,13 @@ barChart('chartTasa', {json.dumps(tasa_l)}, {json.dumps(tasa_v)});
 </html>"""
 
 
-def _render_corporativa(df: pd.DataFrame, ops: pd.DataFrame, fecha) -> str:
+def _render_corporativa(df: pd.DataFrame, ops: pd.DataFrame, fecha, ops_status: str = "") -> str:
     """HTML corporativo con Plotly: plazos × volumen × nemotécnico / tipo de tasa."""
     generated = datetime.now().strftime("%Y-%m-%d %H:%M")
+    if "Indice_norm" not in df.columns:
+        idx_col = _find_col(df, "indice")
+        df = df.copy()
+        df["Indice_norm"] = df[idx_col].apply(_normalizar_indice) if idx_col else "Sin índice"
     vol_total = float(df["Volumen_num"].sum())
     n_titulos = int(df["Nemotecnico_norm"].nunique()) if "Nemotecnico_norm" in df.columns else len(df)
 
@@ -815,6 +878,11 @@ def _render_corporativa(df: pd.DataFrame, ops: pd.DataFrame, fecha) -> str:
     top_labels = top_n["Nemotecnico_norm"].tolist()
     top_vals = [round(float(v) / 1e9, 3) for v in top_n["Volumen_num"].tolist()]
 
+    by_indice = _agg_table(df, "Indice_norm")
+    index_labels = by_indice["Indice_norm"].astype(str).tolist() if not by_indice.empty else []
+    index_values = [round(float(v) / 1e9, 3) for v in by_indice["Volumen"].tolist()] if not by_indice.empty else []
+    index_table = _table_html(by_indice, "Indice_norm") if not by_indice.empty else '<tr><td colspan="4">Sin datos de índice</td></tr>'
+
     detalle_json = json.dumps(_detalle_rows_json(df), ensure_ascii=False)
     ops_json = json.dumps(_ops_rows_json(ops), ensure_ascii=False)
 
@@ -847,6 +915,9 @@ code {{ background:#1e293b; padding:0.1rem 0.35rem; border-radius:4px; color:#7d
 .pager button {{ background:#1e293b; border:1px solid var(--border); color:var(--text); padding:0.35rem 0.75rem; border-radius:8px; cursor:pointer; }}
 .pager button:disabled {{ opacity:0.4; }}
 .pager .info {{ color:var(--muted); font-size:0.85rem; margin-right:auto; }}
+.ops-status {{ color:var(--muted); font-size:0.88rem; line-height:1.5; background:#0b1220; border:1px solid var(--border); padding:0.75rem; border-radius:8px; overflow-wrap:anywhere; }}
+.ops-controls {{ display:flex; align-items:center; gap:0.65rem; margin:0.75rem 0 1rem; flex-wrap:wrap; color:var(--muted); font-size:0.85rem; }}
+.ops-controls select {{ background:#0b1220; color:var(--text); border:1px solid var(--border); border-radius:8px; padding:0.45rem 0.65rem; }}
 footer {{ text-align:center; color:var(--muted); font-size:0.8rem; margin-top:1.5rem; }}
 </style>
 </head>
@@ -859,7 +930,16 @@ footer {{ text-align:center; color:var(--muted); font-size:0.8rem; margin-top:1.
     <div class="kpi"><div class="label">Volumen</div><div class="value">{_fmt_cop(vol_total)}</div></div>
     <div class="kpi"><div class="label">Títulos</div><div class="value">{n_titulos}</div></div>
     <div class="kpi"><div class="label">Filas listado</div><div class="value">{len(df)}</div></div>
+    <div class="kpi"><div class="label">Operaciones extraídas</div><div class="value">{len(ops) if ops is not None else 0:,}</div></div>
   </section>
+
+  <div class="card">
+    <h2>Volumen por índice</h2>
+    <p class="sub">Distribución por el campo Índice (FS, IPC, IB1, etc.). Los guiones y valores ausentes se agrupan como “Sin índice”.</p>
+    <div id="chartIndice" style="height:320px"></div>
+    <table style="margin-top:1rem"><thead><tr><th>Índice</th><th>Títulos</th><th>Volumen</th><th>Participación</th></tr></thead>
+    <tbody>{index_table}</tbody></table>
+  </div>
 
   <div class="card">
     <h2>Volumen por plazo (eje X) y tipo de tasa (series apiladas)</h2>
@@ -882,7 +962,7 @@ footer {{ text-align:center; color:var(--muted); font-size:0.8rem; margin-top:1.
     <table>
       <thead><tr>
         <th>Nemotécnico</th><th>Emisor</th><th>Familia</th><th>Vencimiento</th>
-        <th>Bucket</th><th>Tipo tasa</th><th>Cantidad</th><th>Volumen</th>
+        <th>Bucket</th><th>Índice</th><th>Tipo tasa</th><th>Cantidad</th><th>Volumen</th>
       </tr></thead>
       <tbody id="tbodyListado"></tbody>
     </table>
@@ -894,10 +974,15 @@ footer {{ text-align:center; color:var(--muted); font-size:0.8rem; margin-top:1.
   </div>
 
   <div class="card">
-    <h2>Operaciones Contado (Hora, Rueda, Tasa, Cantidad…)</h2>
+    <h2>Operaciones de la emisión (BVC)</h2>
+    <p class="ops-status">{html_lib.escape(ops_status or "No se generó diagnóstico para la extracción.")}</p>
+    <div class="ops-controls">
+      <label for="filtroTipoOps">Tipo de operación</label>
+      <select id="filtroTipoOps"><option value="">Todas las operaciones</option></select>
+    </div>
     <table>
       <thead><tr>
-        <th>Hora</th><th>Rueda</th><th>Nemotécnico</th><th>Precio</th>
+        <th>Hora</th><th>Tipo de operación</th><th>Rueda</th><th>Nemotécnico</th><th>Precio</th>
         <th>Tasa</th><th>Cantidad</th><th>Volumen</th><th>Procedencia</th>
       </tr></thead>
       <tbody id="tbodyOps"></tbody>
@@ -920,11 +1005,27 @@ let pageL = 0, pageO = 0;
 
 const buckets = {json.dumps(buckets, ensure_ascii=False)};
 const series = {json.dumps(series, ensure_ascii=False)};
+const indexLabels = {json.dumps(index_labels, ensure_ascii=False)};
+const indexValues = {json.dumps(index_values)};
 const bubbles = {json.dumps(bubbles, ensure_ascii=False)};
 const topLabels = {json.dumps(top_labels, ensure_ascii=False)};
 const topVals = {json.dumps(top_vals)};
 
 const palette = ['#38bdf8','#a78bfa','#34d399','#fbbf24','#f472b6','#60a5fa','#c084fc','#2dd4bf','#fb923c','#e879f9','#94a3b8'];
+
+Plotly.newPlot('chartIndice', [{{
+  type: 'bar', orientation: 'h',
+  y: indexLabels.slice().reverse(),
+  x: indexValues.slice().reverse(),
+  marker: {{ color: '#38bdf8' }},
+  hovertemplate: '<b>%{{y}}</b><br>Volumen: %{{x}} miles de millones COP<extra></extra>'
+}}], {{
+  paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
+  font: {{ color: '#9ca3af' }},
+  margin: {{ t: 10, r: 20, b: 35, l: 100 }},
+  xaxis: {{ title: 'Volumen (miles de millones COP)', gridcolor: '#1f2937', zeroline: false }},
+  yaxis: {{ automargin: true, gridcolor: '#1f2937' }}
+}}, {{responsive: true, displayModeBar: false}});
 
 // Stacked bars: X = plazos, stack = tipo tasa, Y = volumen
 Plotly.newPlot('chartStacked', series.map((s, i) => ({{
