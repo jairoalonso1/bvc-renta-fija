@@ -4,7 +4,7 @@ import pandas as pd
 import pytest
 
 from bvc_renta_fija.client import BVCOperationsExtractionError, BVCRentaFija
-from bvc_renta_fija.report import _normalizar_indice, _render_corporativa, enriquecer
+from bvc_renta_fija.report import _normalizar_indice, _render_corporativa, enriquecer, generar_reporte_corporativa, generar_reporte_html
 
 
 def test_normaliza_indices_ausentes_y_codigos():
@@ -91,3 +91,11 @@ def test_normaliza_pestanas_actuales_de_bvc_y_mantiene_simultaneo_legacy():
     )
     assert list(df["Tipo_operacion"]) == ["Contado", "Simultaneo", "Repo", "TTV"]
     assert set(df["Nemotecnico"]) == {"CDTBOCS0V"}
+
+
+
+def test_reporte_corporativo_consulta_todas_las_emisiones_por_defecto():
+    import inspect
+
+    assert inspect.signature(generar_reporte_corporativa).parameters["max_titulos_ops"].default is None
+    assert inspect.signature(generar_reporte_html).parameters["max_titulos_ops"].default is None

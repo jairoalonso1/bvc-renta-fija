@@ -141,3 +141,106 @@ def test_official_operations_api_maps_contado_and_simultaneo():
     df = BVCRentaFija._normalizar_operaciones_api(payload, "CDTFALS0V-TEST", date(2026, 10, 9), "deuda_corporativa")
     assert list(df["Tipo_operacion"]) == ["Contado", "Simultaneo"]
     assert list(df["Hora"]) == ["10:26", "10:27"]
+
+
+
+def test_limpieza_normaliza_encabezados_celdas_y_filas_vacias():
+    raw = pd.DataFrame(
+        [
+            [" CDTBBO80" + chr(160), " BANCO\\tDE BOGOTA "],
+            [None, None],
+        ],
+        columns=pd.MultiIndex.from_tuples(
+            [("Información", "Nemotécnico"), ("Emisor", "Emisor")]
+        ),
+    )
+
+    cleaned = BVCRentaFija._limpiar(raw)
+
+    assert list(cleaned.columns) == ["Información Nemotécnico", "Emisor"]
+    assert len(cleaned) == 1
+    assert cleaned.iloc[0]["Información Nemotécnico"] == "CDTBBO80"
+    assert cleaned.iloc[0]["Emisor"] == "BANCO DE BOGOTA"
+    assert BVCRentaFija._col_nemotecnico(cleaned) == "Información Nemotécnico"
+
+
+def test_limpieza_elimina_encabezados_repetidos_en_cuerpo():
+    raw = pd.DataFrame(
+        [
+            ["Nemotécnico", "Emisor"],
+            ["CDTBBO80", "BANCO DE BOGOTA"],
+        ],
+        columns=["Nemotécnico", "Emisor"],
+    )
+    cleaned = BVCRentaFija._limpiar(raw)
+    assert len(cleaned) == 1
+    assert cleaned.iloc[0]["Nemotécnico"] == "CDTBBO80"
+
+
+def test_get_operaciones_dia_consulta_todas_las_emisiones_por_defecto(monkeypatch):
+    client = BVCRentaFija()
+    identifiers = ["CDTBOCS0V-ISSUE-1", "CDTBBO80-ISSUE-2", "CDTTEST0-ISSUE-3"]
+    monkeypatch.setattr(
+        client, "_get_identificadores_emision",
+        lambda fecha, segmento: identifiers,
+    )
+    queried = []
+
+    def fake_get_operaciones_titulo(identifier, fecha=None, segmento=None, slug_url=None):
+        queried.append(identifier)
+        return pd.DataFrame([{
+            "Hora": f"10:{len(queried):02d}", "Rueda": "TRD",
+            "Precio": 100.0, "Tasa": 10.0, "Cantidad": 1, "Volúmenes": 1,
+            "Procedencia": "Registro", "Tipo_operacion": "Contado",
+            "Nemotecnico": identifier.split("-", 1)[0], "Fecha": "2026-10-26",
+            "Segmento": "deuda_corporativa", "Fuente_datos": "BVC",
+        }])
+
+    monkeypatch.setattr(client, "get_operaciones_titulo", fake_get_operaciones_titulo)
+    result = client.get_operaciones_dia(fecha="2026-10-26")
+
+    assert queried == identifiers
+    assert len(result) == 3
+    assert client.last_operations_diagnostics["emisiones_encontradas"] == 3
+    assert client.last_operations_diagnostics["emisiones_consultadas"] == 3
+    assert client.last_operations_diagnostics["estado"] == "ok"
+
+
+def test_get_operaciones_nemotecnico_consulta_todas_sus_emisiones(monkeypatch):
+    client = BVCRentaFija()
+    identifiers = ["CDTBOCS0V-ISSUE-1", "CDTBBO80-ISSUE-2", "CDTBOCS0V-ISSUE-3"]
+    monkeypatch.setattr(
+        client, "_get_identificadores_emision",
+        lambda fecha, segmento: identifiers,
+    )
+    queried = []
+
+    def fake_get_operaciones_titulo(identifier, fecha=None, segmento=None, slug_url=None):
+        queried.append(identifier)
+        return pd.DataFrame([{
+            "Hora": "11:15", "Rueda": "TRD", "Precio": 99.5, "Tasa": 11.0,
+            "Cantidad": 10, "Volúmenes": 995, "Procedencia": "Registro",
+            "Tipo_operacion": "Contado", "Nemotecnico": identifier.split("-", 1)[0],
+            "Fecha": "2026-10-26", "Segmento": "deuda_corporativa", "Fuente_datos": "BVC",
+        }])
+
+    monkeypatch.setattr(client, "get_operaciones_titulo", fake_get_operaciones_titulo)
+    result = client.get_operaciones_nemotecnico("CDTBOCS0V", fecha="2026-10-26")
+
+    assert queried == ["CDTBOCS0V-ISSUE-1", "CDTBOCS0V-ISSUE-3"]
+    assert len(result) == 2
+    assert set(result["Nemotecnico"]) == {"CDTBOCS0V"}
+    assert client.last_operations_diagnostics["emisiones_encontradas"] == 2
+
+
+def test_bvc_operations_normalizer_accepts_additional_operation_tabs():
+    payload = {"data": {"tab": {
+        "contado": [{"time": "10:00", "board": "TRD", "price": 100, "rate": 10,
+                     "quantity": 1, "volume": 1, "origin": {"es": "Registro"}}],
+        "subasta": [{"time": "10:10", "board": "SUB", "price": 100, "rate": 10,
+                     "quantity": 2, "volume": 2, "origin": {"es": "Subasta"}}],
+    }}}
+    result = BVCRentaFija._normalizar_operaciones_api(
+        payload, "CDTBBO80-ISSUE-1", date(2026, 10, 26), "deuda_corporativa"
+    )
+    assert list(result["Tipo_operacion"]) == ["Contado", "Subasta"]

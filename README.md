@@ -59,26 +59,44 @@ print("Reporte en:", path)
 - **Familia**: TES Tasa Fija, TES UVR, TIDIS, CDT, Bonos, TDA, Otros
 - **Bucket**: < 1 año | 1–3 | 3–5 | 5–10 | > 10 años
 
-## Ficha facial y operaciones de un título
+## Ficha y operaciones intradía
 
-La librería también puede abrir la ficha de una emisión y consultar las operaciones **Contado** desde el endpoint de mercado que usa el propio frontend oficial de BVC. Playwright se utiliza para iniciar la sesión pública del sitio y obtener los encabezados temporales requeridos; las filas se normalizan desde la respuesta JSON, no se reconstruyen a partir de datos sintéticos. En la BVC, un nemotécnico puede corresponder a varias emisiones y vencimientos; para seleccionar una emisión concreta, pase `slug_url` con la URL exacta del detalle cuando esté disponible.
+La librería consulta las operaciones intradía desde el endpoint utilizado por el frontend oficial de BVC. Playwright inicia la sesión pública del sitio y obtiene los encabezados temporales requeridos; las filas se normalizan desde la respuesta JSON, no se reconstruyen a partir de datos sintéticos.
 
-```python
+BVC puede tener varias emisiones y vencimientos asociados a un mismo nemotécnico corto. Use get_operaciones_nemotecnico para consolidar todas las emisiones asociadas al NEMO en una fecha, o get_operaciones_titulo con el identificador completo / slug_url para una emisión específica.
+
+La salida de operaciones incluye Hora, Rueda, Precio, Tasa, Cantidad, Volúmenes, Procedencia, Tipo_operacion, Nemotecnico, Fecha, Segmento y Fuente_datos. Se incluyen las categorías conocidas (Contado, Simultáneo, Repo y TTV) y cualquier pestaña adicional que BVC publique como una lista de operaciones. Si la BVC no devuelve movimientos, no se inventan filas. Los errores técnicos quedan explícitos y no deben confundirse con cero operaciones.
+
+Por defecto, get_operaciones_dia(fecha=...) consulta **todas las emisiones** identificadas por BVC para esa fecha. No existe un límite predeterminado de 12 o 15 emisiones. Puede definir max_titulos solo cuando necesite limitar expresamente la extracción.
+
+Ejemplo de uso:
+
+~~~python
 from bvc_renta_fija import BVCRentaFija
 
-with BVCRentaFija(headless=True) as client:
-    # Use el símbolo correcto: CDTBB080 (con cero) no es el ticker CDTBBO80 (con O).
-    ficha = client.get_detalle_titulo("CDTBBO80", segmento="deuda_corporativa")
-    ops = client.get_operaciones_titulo("CDTBBO80", fecha="2026-10-22", segmento="deuda_corporativa")
-    print(ficha)
-    print(ops)
-```
+with BVCRentaFija(headless=True, cache_dir="./cache") as client:
+    # Todas las operaciones de todas las emisiones del día
+    todas = client.get_operaciones_dia(
+        fecha="2026-10-26",
+        segmento="deuda_corporativa",
+    )
 
-`get_operaciones_titulo` devuelve las columnas `Hora`, `Rueda`, `Precio`, `Tasa`, `Cantidad`, `Volúmenes` y `Procedencia`, además de `Nemotecnico`, `Fecha`, `Segmento` y `Fuente_datos`. Solo se extraen filas que devuelve la API oficial en `data.tab.contado`; no se inventan operaciones si la BVC no devuelve movimientos. Si el sitio bloquea la sesión, no genera el encabezado temporal requerido o la API rechaza la consulta, se genera un error explícito en vez de devolver una tabla vacía que parezca un día sin operaciones.
+    # Operaciones de todas las emisiones que corresponden a este nemotécnico
+    por_nemotecnico = client.get_operaciones_nemotecnico(
+        nemotecnico="CDTBBO80",
+        fecha="2026-10-26",
+        segmento="deuda_corporativa",
+    )
 
-`get_operaciones_dia(fecha=..., max_titulos=20)` ofrece una consolidación acotada por los primeros títulos únicos del listado. Para evitar carga innecesaria sobre la BVC, ajuste `max_titulos`; para una extracción exhaustiva, primero hay que confirmar límites de uso y disponibilidad de los datos de cada modalidad.
+    # Límite opcional y explícito
+    muestra = client.get_operaciones_dia(
+        fecha="2026-10-26",
+        segmento="deuda_corporativa",
+        max_titulos=10,
+    )
+~~~
 
-**Importante sobre la validación:** se comprobó en una sesión del sitio oficial que el endpoint devuelve tres operaciones para `TFIT16300632` el 22 de octubre de 2026 (10:46, 10:50 y 11:42). Los valores de mercado se leen en tiempo de ejecución desde la respuesta de BVC; el caso se usa en pruebas de integración, no como dato hardcodeado de producción. Algunos entornos automatizados pueden recibir un 403 de CloudFront al abrir el sitio, lo que es una restricción de acceso del entorno y no una respuesta de mercado vacía.
+Los diagnósticos de extracción se guardan en client.last_operations_diagnostics. Si fallan todas las consultas a la API, se lanza BVCOperationsExtractionError en vez de afirmar que no hubo operaciones.
 
 ## Reporte corporativo: índice y operaciones
 
