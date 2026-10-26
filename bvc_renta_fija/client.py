@@ -37,6 +37,10 @@ class BVCSegmentSelectionError(RuntimeError):
     """Raised when BVC cannot confirm selection of the requested segment."""
 
 
+class BVCOperationsExtractionError(RuntimeError):
+    """Raised when all BVC operation queries fail, rather than implying no trades."""
+
+
 BASE_URL = "https://www.bvc.com.co/mercado-local-en-linea?tab=renta-fija"
 
 Segmento = Literal[
@@ -86,6 +90,7 @@ class BVCRentaFija:
         self._browser: Optional[Browser] = None
         self._context: Optional[BrowserContext] = None
         self._playwright = None
+        self.last_operations_diagnostics: dict = {}
 
     def __enter__(self):
         self._start()
@@ -226,7 +231,11 @@ class BVCRentaFija:
 
     @staticmethod
     def _normalizar_operaciones_api(payload: dict, nemotecnico: str, fecha: date, segmento: Optional[Segmento]) -> pd.DataFrame:
-        """Normaliza operaciones BVC de contado y simultáneas sin descartar tipos."""
+        """Normaliza las categorías de operaciones que devuelve la API oficial de BVC.
+
+        El frontend actual usa contado, repo y ttv; se mantiene compatibilidad
+        con la clave histórica simultaneo.
+        """
         cols = ["Hora", "Rueda", "Precio", "Tasa", "Cantidad", "Volúmenes", "Procedencia", "Tipo_operacion"]
         outcols = cols + ["Nemotecnico", "Fecha", "Segmento", "Fuente_datos"]
         data = payload.get("data") if isinstance(payload, dict) else None
@@ -234,8 +243,17 @@ class BVCRentaFija:
         normalized = []
         if not isinstance(tab, dict):
             tab = {}
-        for operation_type in ("contado", "simultaneo"):
-            rows = tab.get(operation_type, [])
+
+        operation_types = (
+            ("contado", "Contado"),
+            ("simultaneo", "Simultaneo"),
+            ("simultaneas", "Simultaneas"),
+            ("repo", "Repo"),
+            ("ttv", "TTV"),
+        )
+        display_symbol = str(nemotecnico).strip().upper().split("-", 1)[0]
+        for operation_key, operation_label in operation_types:
+            rows = tab.get(operation_key, [])
             if not isinstance(rows, list):
                 continue
             for item in rows:
@@ -244,7 +262,20 @@ class BVCRentaFija:
                 origin = item.get("origin")
                 if isinstance(origin, dict):
                     origin = origin.get("es") or origin.get("en")
-                normalized.append({"Hora": item.get("time"), "Rueda": item.get("board"), "Precio": item.get("price"), "Tasa": item.get("rate"), "Cantidad": item.get("quantity"), "Volúmenes": item.get("volume"), "Procedencia": origin, "Tipo_operacion": operation_type.capitalize(), "Nemotecnico": str(nemotecnico).strip().upper(), "Fecha": fecha.isoformat(), "Segmento": segmento, "Fuente_datos": "BVC"})
+                normalized.append({
+                    "Hora": item.get("time"),
+                    "Rueda": item.get("board"),
+                    "Precio": item.get("price"),
+                    "Tasa": item.get("rate"),
+                    "Cantidad": item.get("quantity"),
+                    "Volúmenes": item.get("volume"),
+                    "Procedencia": origin,
+                    "Tipo_operacion": operation_label,
+                    "Nemotecnico": display_symbol,
+                    "Fecha": fecha.isoformat(),
+                    "Segmento": segmento,
+                    "Fuente_datos": "BVC",
+                })
         return pd.DataFrame(normalized, columns=outcols)
 
     def get_operaciones_titulo(self, nemotecnico: str, fecha: Optional[FechaLike] = None, segmento: Optional[Segmento] = "deuda_corporativa", slug_url: Optional[str] = None) -> pd.DataFrame:
@@ -377,45 +408,107 @@ class BVCRentaFija:
             page.close()
 
     def get_operaciones_dia(self, fecha: Optional[FechaLike] = None, segmento: Optional[Segmento] = "deuda_corporativa", max_titulos: Optional[int] = None) -> pd.DataFrame:
-        """Consolida las operaciones de todas las emisiones del día y las ordena por hora.
+        """Consolida operaciones intradía y deja diagnóstico de las consultas.
 
-        Para deuda corporativa consulta los identificadores completos de emisión
-        que entrega la API de BVC, evitando perder operaciones cuando un ticker
-        corto agrupa varias emisiones. `max_titulos` limita opcionalmente el número
-        de emisiones, útil para pruebas rápidas.
+        Si fallan todas las consultas por errores técnicos, lanza
+        BVCOperationsExtractionError. Una respuesta válida sin filas se
+        conserva como sin operaciones, pero no se confunde con un fallo de
+        extracción.
         """
-        outcols = ["Hora", "Rueda", "Precio", "Tasa", "Cantidad", "Volúmenes", "Procedencia", "Tipo_operacion", "Nemotecnico", "Fecha", "Segmento", "Fuente_datos"]
+        outcols = ["Hora", "Rueda", "Precio", "Tasa", "Cantidad", "Volúmenes",
+                   "Procedencia", "Tipo_operacion", "Nemotecnico", "Fecha",
+                   "Segmento", "Fuente_datos"]
         seg = segmento or "deuda_corporativa"
-        if fecha is None:
-            target = date.today()
-        else:
-            target = _parse_fecha(fecha)
-        if seg == "deuda_corporativa":
-            identifiers = self._get_identificadores_emision(target, seg)
-        else:
-            listing = self._get(seg, fecha=target)
-            col = self._col_nemotecnico(listing)
-            if listing.empty or col is None:
-                return pd.DataFrame(columns=outcols)
-            identifiers = listing[col].dropna().astype(str).str.strip().str.upper().drop_duplicates().tolist()
+        target = date.today() if fecha is None else _parse_fecha(fecha)
+        diagnostics = {
+            "fecha": target.isoformat(),
+            "segmento": seg,
+            "emisiones_encontradas": 0,
+            "emisiones_consultadas": 0,
+            "emisiones_con_datos": 0,
+            "emisiones_sin_datos": 0,
+            "consultas_fallidas": [],
+            "filas": 0,
+            "estado": "iniciando",
+        }
+        self.last_operations_diagnostics = diagnostics
+
+        try:
+            if seg == "deuda_corporativa":
+                identifiers = self._get_identificadores_emision(target, seg)
+            else:
+                listing = self._get(seg, fecha=target)
+                col = self._col_nemotecnico(listing)
+                if listing.empty or col is None:
+                    diagnostics["estado"] = "sin_listado"
+                    return pd.DataFrame(columns=outcols)
+                identifiers = (
+                    listing[col].dropna().astype(str).str.strip()
+                    .str.upper().drop_duplicates().tolist()
+                )
+        except Exception as exc:
+            diagnostics["estado"] = "error_listado"
+            diagnostics["error"] = str(exc)[:1000]
+            raise
+
         if max_titulos is not None:
             identifiers = identifiers[:max(1, int(max_titulos))]
+        diagnostics["emisiones_encontradas"] = len(identifiers)
+        if not identifiers:
+            diagnostics["estado"] = "sin_emisiones"
+            return pd.DataFrame(columns=outcols)
+
         frames = []
         root = "https://www.bvc.com.co/renta-fija-deuda-corporativa"
         for identifier in identifiers:
+            diagnostics["emisiones_consultadas"] += 1
             try:
-                slug_url = f"{root}/{identifier.lower()}?tab=operaciones" if seg == "deuda_corporativa" else None
-                df = self.get_operaciones_titulo(identifier, fecha=target, segmento=seg, slug_url=slug_url)
+                slug_url = (
+                    f"{root}/{identifier.lower()}?tab=operaciones"
+                    if seg == "deuda_corporativa" else None
+                )
+                df = self.get_operaciones_titulo(
+                    identifier, fecha=target, segmento=seg, slug_url=slug_url
+                )
                 if not df.empty:
                     frames.append(df)
+                    diagnostics["emisiones_con_datos"] += 1
+                else:
+                    diagnostics["emisiones_sin_datos"] += 1
             except Exception as exc:
-                logger.warning("No se pudo extraer operaciones de emisión %s (fecha=%s): %s", identifier, target, exc)
+                diagnostics["consultas_fallidas"].append({
+                    "identificador": identifier,
+                    "error": str(exc)[:500],
+                })
+                logger.warning(
+                    "No se pudo extraer operaciones de emisión %s (fecha=%s): %s",
+                    identifier, target, exc
+                )
+
         if not frames:
+            if diagnostics["consultas_fallidas"]:
+                diagnostics["estado"] = "error"
+                examples = "; ".join(
+                    f"{x['identificador']}: {x['error']}"
+                    for x in diagnostics["consultas_fallidas"][:3]
+                )
+                raise BVCOperationsExtractionError(
+                    f"Fallaron las consultas de las {len(diagnostics['consultas_fallidas'])} "
+                    f"emisiones intentadas para {target.isoformat()}; no se pudo verificar "
+                    f"si hubo operaciones. Detalles: {examples}"
+                )
+            diagnostics["estado"] = "sin_operaciones"
             return pd.DataFrame(columns=outcols)
-        result = pd.concat(frames, ignore_index=True)  # BVC no entrega ID de operación: no descartar filas idénticas
+
+        result = pd.concat(frames, ignore_index=True)
         if "Hora" in result.columns:
             result = result.sort_values("Hora", kind="stable", na_position="last")
-        return result.reindex(columns=outcols).reset_index(drop=True)
+        result = result.reindex(columns=outcols).reset_index(drop=True)
+        diagnostics["filas"] = len(result)
+        diagnostics["estado"] = "parcial" if diagnostics["consultas_fallidas"] else "ok"
+        result.attrs["diagnostics"] = dict(diagnostics)
+        self.last_operations_diagnostics = diagnostics
+        return result
 
     # ------------------------------------------------------------------
     # Internos
