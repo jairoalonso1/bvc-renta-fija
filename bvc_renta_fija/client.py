@@ -223,7 +223,7 @@ class BVCRentaFija:
     @staticmethod
     def _normalizar_operaciones_api(payload: dict, nemotecnico: str, fecha: date, segmento: Optional[Segmento]) -> pd.DataFrame:
         """Normaliza operaciones BVC de contado y simultÃ¡neas sin descartar tipos."""
-        cols = ["Hora", "Rueda", "Precio", "Tasa", "Cantidad", "VolÃºmenes", "Procedencia", "Tipo_operacion"]
+        cols = ["Hora", "Rueda", "Precio", "Tasa", "Cantidad", "Volúmenes", "Procedencia", "Tipo_operacion"]
         outcols = cols + ["Nemotecnico", "Fecha", "Segmento", "Fuente_datos"]
         data = payload.get("data") if isinstance(payload, dict) else None
         tab = data.get("tab", {}) if isinstance(data, dict) else {}
@@ -240,7 +240,7 @@ class BVCRentaFija:
                 origin = item.get("origin")
                 if isinstance(origin, dict):
                     origin = origin.get("es") or origin.get("en")
-                normalized.append({"Hora": item.get("time"), "Rueda": item.get("board"), "Precio": item.get("price"), "Tasa": item.get("rate"), "Cantidad": item.get("quantity"), "VolÃºmenes": item.get("volume"), "Procedencia": origin, "Tipo_operacion": operation_type.capitalize(), "Nemotecnico": str(nemotecnico).strip().upper(), "Fecha": fecha.isoformat(), "Segmento": segmento, "Fuente_datos": "BVC"})
+                normalized.append({"Hora": item.get("time"), "Rueda": item.get("board"), "Precio": item.get("price"), "Tasa": item.get("rate"), "Cantidad": item.get("quantity"), "Volúmenes": item.get("volume"), "Procedencia": origin, "Tipo_operacion": operation_type.capitalize(), "Nemotecnico": str(nemotecnico).strip().upper(), "Fecha": fecha.isoformat(), "Segmento": segmento, "Fuente_datos": "BVC"})
         return pd.DataFrame(normalized, columns=outcols)
 
     def get_operaciones_titulo(self, nemotecnico: str, fecha: Optional[FechaLike] = None, segmento: Optional[Segmento] = "deuda_corporativa", slug_url: Optional[str] = None) -> pd.DataFrame:
@@ -252,7 +252,7 @@ class BVCRentaFija:
         """
         target = _parse_fecha(fecha) if fecha is not None else date.today()
         symbol = str(nemotecnico).strip().upper()
-        outcols = ["Hora", "Rueda", "Precio", "Tasa", "Cantidad", "VolÃºmenes", "Procedencia", "Tipo_operacion",
+        outcols = ["Hora", "Rueda", "Precio", "Tasa", "Cantidad", "Volúmenes", "Procedencia", "Tipo_operacion",
                    "Nemotecnico", "Fecha", "Segmento", "Fuente_datos"]
         if segmento == "deuda_publica_segmento_publico":
             filter_key, segment_filter = "marketDataRfPub", "&filters[marketDataRfPub][segment]=A2A"
@@ -291,7 +291,7 @@ class BVCRentaFija:
             if not captured.get("k"):
                 raise RuntimeError(
                     "BVC no generÃ³ la peticiÃ³n inicial de operaciones; no fue posible "
-                    f"capturar el encabezado k. URL={page.url!r}; tÃ­tulo={page.title()!r}"
+                    f"capturar el encabezado k. URL={page.url!r}; título={page.title()!r}"
                 )
 
             query = (
@@ -380,7 +380,7 @@ class BVCRentaFija:
         corto agrupa varias emisiones. `max_titulos` limita opcionalmente el nÃºmero
         de emisiones, Ãºtil para pruebas rÃ¡pidas.
         """
-        outcols = ["Hora", "Rueda", "Precio", "Tasa", "Cantidad", "VolÃºmenes", "Procedencia", "Tipo_operacion", "Nemotecnico", "Fecha", "Segmento", "Fuente_datos"]
+        outcols = ["Hora", "Rueda", "Precio", "Tasa", "Cantidad", "Volúmenes", "Procedencia", "Tipo_operacion", "Nemotecnico", "Fecha", "Segmento", "Fuente_datos"]
         seg = segmento or "deuda_corporativa"
         if fecha is None:
             target = date.today()
@@ -533,8 +533,8 @@ class BVCRentaFija:
             title = page.title()
             excerpt = re.sub(r"\s+", " ", page.locator("body").inner_text() if page.locator("body").count() else "")[:300]
             raise BVCDateSelectionError(
-                f"BVC no renderizÃ³ el selector de fecha para {target.isoformat()}. "
-                f"URL={page.url!r}; tÃ­tulo={title!r}; contenido={excerpt!r}"
+                f"BVC no renderizó el selector de fecha para {target.isoformat()}. "
+                f"URL={page.url!r}; título={title!r}; contenido={excerpt!r}"
             )
 
         date_input = page.locator(date_selector).first
@@ -575,7 +575,7 @@ class BVCRentaFija:
             excerpt = re.sub(r"\s+", " ", page.locator("body").inner_text() if page.locator("body").count() else "")[:300]
             raise BVCDateSelectionError(
                 f"No se encontrÃ³ el botÃ³n del calendario de BVC para {target.isoformat()}. "
-                f"URL={page.url!r}; tÃ­tulo={title!r}; contenido={excerpt!r}"
+                f"URL={page.url!r}; título={title!r}; contenido={excerpt!r}"
             )
 
         calendar_button.click()
